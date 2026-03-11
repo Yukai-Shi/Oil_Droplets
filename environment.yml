@@ -1,0 +1,53 @@
+name: vortex-rl
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10.14           # ✅ cleanrl 兼容的最新稳定版
+  - pip
+
+  # === 核心科学计算 ===
+  - numpy=1.26.4
+  - scipy
+  - matplotlib
+  - jupyterlab
+  - tqdm
+  - ffmpeg                   # conda 版更稳
+
+  # === 视频/渲染 ===
+  - imageio=2.35.*
+  - imageio-ffmpeg=0.5.1
+  - opencv
+  - pillow
+
+  # === 其他 ===
+  - seaborn
+  - pandas
+  - scikit-learn
+  - h5py
+  - pyyaml
+  - rich
+  - gpustat
+  - psutil
+
+  # # === pip 安装部分（含清华源加速）===
+  # - pip:
+  #     - --index-url https://pypi.tuna.tsinghua.edu.cn/simple
+  #     - --extra-index-url https://download.pytorch.org/whl/cu124
+
+  #     - torch==2.5.1+cu124
+  #     - torchvision==0.20.1+cu124
+  #     - torchaudio==2.5.1+cu124
+
+  #     - stable-baselines3[extra]>=2.3.2
+  #     - shimmy>=1.0.0
+  #     - gymnasium>=0.29.1
+  #     - cleanrl>=1.1.0
+  #     - ray[rllib,tune]==2.38.0
+  #     - tensorboard>=2.17
+  #     - wandb>=0.18.1
+  #     - taichi==1.7.2

@@ -1,0 +1,31 @@
+.ipynb_checkpoints
+.vscode/
+.DS_Store
+Manifest.toml
+LocalPreferences.toml
+/docs/build/
+
+# gfx
+*.png
+*.jpg
+*.gif
+*.mp4
+*.svg
+*.pdf
+*.ogv
+
+# data file
+*.dat
+*.txt
+*.log
+*.json
+*.npz
+*.zip
+*.pkl
+
+# paraview
+*.vti
+*.pvd
+
+# tensorboard
+tb_logs/
