@@ -1,7 +1,14 @@
-import numpy as np
-from typing import Tuple
+from typing import Optional, Tuple
 
-from config import StokesCylinderConfig, TrajectorySettingConfig, RenderSettingConfig
+import numpy as np
+
+from config import (
+    FixedGrid3x3Config,
+    LayoutModeConfig,
+    RenderSettingConfig,
+    StokesCylinderConfig,
+    TrajectorySettingConfig,
+)
 from utils.calc import calculate_point_velocity, is_legal
 
 
@@ -23,9 +30,20 @@ class FluidEnv:
     def __init__(
         self,
         start_pos: Tuple[float, float] = (0.0, 0.0),
-        seed=None
+        seed=None,
+        layout_mode: Optional[str] = None,
     ):
-        self.max_n = StokesCylinderConfig.NUM_CYLINDERS
+        self.layout_mode = layout_mode or LayoutModeConfig.LAYOUT_MODE
+        if self.layout_mode not in {"free_layout", "fixed_grid_3x3"}:
+            raise ValueError(f"Unknown layout_mode: {self.layout_mode}")
+
+        if self.layout_mode == "fixed_grid_3x3":
+            self.max_n = FixedGrid3x3Config.NUM_CYLINDERS
+            self.grid_x, self.grid_y = FixedGrid3x3Config.grid_coords()
+        else:
+            self.max_n = StokesCylinderConfig.NUM_CYLINDERS
+            self.grid_x, self.grid_y = None, None
+
         self.fixed_omega = StokesCylinderConfig.FIXED_OMEGA
 
         self.cylinders_x = np.zeros(self.max_n, dtype=np.float32)
@@ -43,27 +61,44 @@ class FluidEnv:
 
     def reset(self, pos: np.ndarray) -> np.ndarray:
         self.step_count = 0
-
-        self.cylinders_x.fill(0.0)
-        self.cylinders_y.fill(0.0)
         self.cylinders_r.fill(0.0)
+
+        if self.layout_mode == "fixed_grid_3x3":
+            self.cylinders_x[:] = self.grid_x
+            self.cylinders_y[:] = self.grid_y
+        else:
+            self.cylinders_x.fill(0.0)
+            self.cylinders_y.fill(0.0)
 
         self.particle.reset(pos.astype(np.float32))
         return self.get_state()
 
     def get_state(self) -> np.ndarray:
         xp = np.array([self.particle.pos_x, self.particle.pos_y], dtype=np.float32)
-        layout = np.concatenate(
-            [self.cylinders_x, self.cylinders_y, self.cylinders_r],
-            axis=0
-        ).astype(np.float32)
+        if self.layout_mode == "fixed_grid_3x3":
+            layout = self.cylinders_r.astype(np.float32)
+        else:
+            layout = np.concatenate(
+                [self.cylinders_x, self.cylinders_y, self.cylinders_r], axis=0
+            ).astype(np.float32)
         return np.concatenate([xp, layout], axis=0).astype(np.float32)
 
     def apply_layout(self, action: np.ndarray):
+        r_low = StokesCylinderConfig.MIN_R
+        r_high = StokesCylinderConfig.MAX_R
+
+        if self.layout_mode == "fixed_grid_3x3":
+            radii = np.asarray(action, dtype=np.float32).reshape(self.max_n)
+            radii = np.clip(radii, r_low, r_high)
+            self.cylinders_x[:] = self.grid_x
+            self.cylinders_y[:] = self.grid_y
+            self.cylinders_r[:] = radii
+            return
+
         new_layout = np.asarray(action, dtype=np.float32).reshape(self.max_n, 3)
         self.cylinders_x[:] = new_layout[:, 0]
         self.cylinders_y[:] = new_layout[:, 1]
-        self.cylinders_r[:] = new_layout[:, 2]
+        self.cylinders_r[:] = np.clip(new_layout[:, 2], r_low, r_high)
 
     def step(self, action: np.ndarray = None):
         self.step_count += 1
@@ -82,7 +117,7 @@ class FluidEnv:
                 self.cylinders_x,
                 self.cylinders_y,
                 self.cylinders_r,
-                omegas
+                omegas,
             )
             self.particle.vx = float(vx)
             self.particle.vy = float(vy)
@@ -96,25 +131,29 @@ class FluidEnv:
             if not is_legal(
                 [self.particle.pos_x, self.particle.pos_y],
                 centers=centers,
-                radii=self.cylinders_r
+                radii=self.cylinders_r,
             ):
                 done = True
                 break
 
             x_min, x_max = RenderSettingConfig.X_LIM
             y_min, y_max = RenderSettingConfig.Y_LIM
-            if not (x_min <= self.particle.pos_x <= x_max and y_min <= self.particle.pos_y <= y_max):
+            if not (
+                x_min <= self.particle.pos_x <= x_max
+                and y_min <= self.particle.pos_y <= y_max
+            ):
                 done = True
                 break
 
         extra_info = {
             "history_pos": history_pos,
             "particle_pos": (self.particle.pos_x, self.particle.pos_y),
+            "layout_mode": self.layout_mode,
             "layout": {
                 "x": self.cylinders_x.copy(),
                 "y": self.cylinders_y.copy(),
                 "r": self.cylinders_r.copy(),
-            }
+            },
         }
 
         return self.get_state(), done, extra_info

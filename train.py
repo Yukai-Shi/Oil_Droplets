@@ -1,4 +1,4 @@
-# train_one_shot.py
+﻿# train_one_shot.py
 import os
 import platform
 import torch
@@ -20,12 +20,13 @@ from envs.Wrapper import TaskContext, FollowerEnv
 from envs.FluidEnv import FluidEnv
 from envs.Renderer import FluidRenderer
 from utils.reseed import reseed_everything
-from config import TrainingSettingConfig
+from config import LayoutModeConfig
 
 WORKERS = 4
+LAYOUT_MODE = LayoutModeConfig.LAYOUT_MODE
 TOTAL_TIMESTEPS = 1_000_00000
 SAVE_DIR = "models"
-EVAL_FREQ = 10000
+EVAL_FREQ = 5000
 N_EVAL_EPISODES = 1
 PATIENCE_EVALS = 50
 SEED = 0
@@ -41,11 +42,20 @@ PPO_CFG = dict(
     gamma=0.99,
 )
 
-def render_evaluation_run(model_path, vecnorm_path, output_dir, filename_prefix):
+def render_evaluation_run(
+    model_path,
+    vecnorm_path,
+    output_dir,
+    filename_prefix,
+    layout_mode=LAYOUT_MODE,
+):
     print("[Visualization] Generating GIF visualization...")
 
     ctx = TaskContext()
-    fe = FluidEnv(start_pos=np.array([-0.025, 0.06], dtype=np.float32))
+    fe = FluidEnv(
+        start_pos=np.array([-0.025, 0.06], dtype=np.float32),
+        layout_mode=layout_mode,
+    )
     follower_env = FollowerEnv(fluid_env=fe, ctx=ctx)
     vec_env = DummyVecEnv([lambda: follower_env])
 
@@ -62,6 +72,12 @@ def render_evaluation_run(model_path, vecnorm_path, output_dir, filename_prefix)
     obs, reward, done, info = vec_env.step(action)
 
     info0 = info[0]
+    mean_path_dist = info0.get("mean_path_dist", None)
+    final_dist = info0.get("final_dist", None)
+    block_pen = info0.get("path_block_penalty", None)
+    flow_dir_pen = info0.get("flow_dir_penalty", None)
+    flow_speed_pen = info0.get("flow_speed_penalty", None)
+    flow_reverse_ratio = info0.get("flow_reverse_ratio", None)
 
     path_history = info0.get("history_pos", [])
     target_path = info0.get("target_path", ctx.path.tolist())
@@ -86,7 +102,12 @@ def render_evaluation_run(model_path, vecnorm_path, output_dir, filename_prefix)
         }
     }
 
-    print(f"[Visualization] reward={reward[0]:.2f}, path_len={len(path_history)}")
+    print(
+        f"[Visualization] reward={reward[0]:.2f}, path_len={len(path_history)}, "
+        f"mean_path_dist={mean_path_dist}, final_dist={final_dist}, "
+        f"path_block_penalty={block_pen}, flow_dir={flow_dir_pen}, "
+        f"flow_speed={flow_speed_pen}, flow_reverse={flow_reverse_ratio}"
+    )
 
     frames = []
 
@@ -108,23 +129,45 @@ def render_evaluation_run(model_path, vecnorm_path, output_dir, filename_prefix)
         target_idx = min(k - 1, len(target_path) - 1)
         current_target = np.array(target_path[target_idx], dtype=np.float32)
 
+        title = f"One-Shot Eval | Reward: {reward[0]:.2f}"
+        if mean_path_dist is not None and final_dist is not None:
+            title += f" | mean: {float(mean_path_dist):.4f} | final: {float(final_dist):.4f}"
+        if block_pen is not None:
+            title += f" | block: {float(block_pen):.4f}"
+        if flow_dir_pen is not None and flow_speed_pen is not None:
+            title += f" | fdir: {float(flow_dir_pen):.3f}"
+            title += f" | fspd: {float(flow_speed_pen):.3f}"
+        if flow_reverse_ratio is not None:
+            title += f" | frev: {float(flow_reverse_ratio):.2f}"
+
         frame = renderer.render(
             scene=scene_k,
             follower_path=current_path,
             target_pos=current_target,
             target_path=target_path,
-            title=f"One-Shot Eval | Reward: {reward[0]:.2f}",
+            title=title,
             draw_flow=True
         )
         frames.append(frame)
 
     if len(frames) == 0:
+        title = f"One-Shot Eval | Reward: {reward[0]:.2f}"
+        if mean_path_dist is not None and final_dist is not None:
+            title += f" | mean: {float(mean_path_dist):.4f} | final: {float(final_dist):.4f}"
+        if block_pen is not None:
+            title += f" | block: {float(block_pen):.4f}"
+        if flow_dir_pen is not None and flow_speed_pen is not None:
+            title += f" | fdir: {float(flow_dir_pen):.3f}"
+            title += f" | fspd: {float(flow_speed_pen):.3f}"
+        if flow_reverse_ratio is not None:
+            title += f" | frev: {float(flow_reverse_ratio):.2f}"
+
         frame = renderer.render(
             scene=scene_final,
             follower_path=path_history,
             target_pos=np.array(target_path[-1], dtype=np.float32),
             target_path=target_path,
-            title=f"One-Shot Eval | Reward: {reward[0]:.2f}",
+            title=title,
             draw_flow=True
         )
         frames.append(frame)
@@ -165,7 +208,8 @@ class EvalCallbackWithEarlyStop(EvalCallback):
                     model_path=os.path.join(self.best_model_save_path, "best_model.zip"),
                     vecnorm_path=vn_path,
                     output_dir=self.best_model_save_path,
-                    filename_prefix=f"best_bezier_t{self.num_timesteps}_"
+                    filename_prefix=f"best_{LAYOUT_MODE}_t{self.num_timesteps}_",
+                    layout_mode=LAYOUT_MODE,
                 )
             else:
                 self.no_improve_count += 1
@@ -183,19 +227,22 @@ if __name__ == "__main__":
 
     reseed_everything(SEED)
 
-    def make_env_fn(seed=None):
+    def make_env_fn(seed=None, layout_mode=LAYOUT_MODE):
         def _init():
             ctx = TaskContext()
-            fe = FluidEnv(start_pos=np.array([-0.025, 0.06], dtype=np.float32))
+            fe = FluidEnv(
+                start_pos=np.array([-0.025, 0.06], dtype=np.float32),
+                layout_mode=layout_mode,
+            )
             env = FollowerEnv(fluid_env=fe, ctx=ctx)
             return env
         return _init
 
-    env_fns = [make_env_fn(seed=i) for i in range(WORKERS)]
+    env_fns = [make_env_fn(seed=i, layout_mode=LAYOUT_MODE) for i in range(WORKERS)]
     vec_env = DummyVecEnv(env_fns)
     vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False)
 
-    eval_env = DummyVecEnv([make_env_fn(seed=999)])
+    eval_env = DummyVecEnv([make_env_fn(seed=999, layout_mode=LAYOUT_MODE)])
     eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False)
     eval_env.training = False
     eval_env.norm_reward = False
@@ -218,5 +265,5 @@ if __name__ == "__main__":
         verbose=1,
     )
 
-    print("🚀 启动单次决策布局优化训练...")
+    print(f"Start training one-shot layout optimization | mode={LAYOUT_MODE}")
     model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=[eval_cb])
