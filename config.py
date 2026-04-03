@@ -67,7 +67,7 @@ class TrajectorySettingConfig:
 class InflowConfig:
     # Uniform inflow added to cylinder-induced velocity field.
     # Default is horizontal inflow from left to right.
-    U_IN = 0.002
+    U_IN = 0.004
     V_IN = 0.0
 
     # Whether inflow components are optimized by policy in *_inflow modes.
@@ -150,8 +150,8 @@ class Gate3LevelConfig:
 
 class LogicBoxConfig:
     # Rectangular local black-box area (used when BOUNDS_MODE="local_box").
-    BOX_X_RANGE = (-0.08, 0.08)
-    BOX_Y_RANGE = (-0.10, 0.10)
+    BOX_X_RANGE = (-0.14, 0.18)
+    BOX_Y_RANGE = (-0.14, 0.14)
     # Boundary mode for logic-box tasks:
     # - "local_box": use BOX_X/Y_RANGE
     # - "global_field": use full render field (RenderSettingConfig.X/Y_LIM)
@@ -164,6 +164,9 @@ class LogicBoxConfig:
     RIGHT_PORT_Y = np.array([0.065, 0.000, -0.065], dtype=np.float32)
     TOP_PORT_X = 0.000
     BOTTOM_PORT_X = 0.000
+    # If True, port coordinates above are interpreted in BOX_X/Y_RANGE reference space
+    # and automatically scaled to current logic bounds (local_box or global_field).
+    PORT_AUTO_SCALE_TO_BOUNDS = True
 
     # Routing task: from SOURCE_PORT to TARGET_PORT.
     # SOURCE:  L0/L1/L2
@@ -175,7 +178,11 @@ class LogicBoxConfig:
     # - "multi_map": optimize multiple fixed source->target routes together
     # - "single_multi_target": fixed SOURCE_PORT, per-episode target sampled from TARGET_PORT_SET
     ROUTE_MODE = "single_multi_target"
-    TARGET_PORT_SET = ["R0", "R1", "R2"]
+    TARGET_PORT_SET = ["T0", "R0", "B0"]
+    # single_multi_target best-checkpoint criterion:
+    # - "min": maximize worst-target reward (recommended for one-to-many robustness)
+    # - "mean": maximize average reward over targets
+    MULTI_TARGET_BEST_METRIC = "min"
     # Used when ROUTE_MODE="multi_map".
     # Default mapping: L0->T0, L1->R1, L2->B0
     MULTI_ROUTE_PAIRS = [
@@ -210,8 +217,16 @@ class LogicBoxConfig:
     TRACE_DT = 0.004
     TRACE_STEPS = 300
     MIN_FORWARD_VX = 2e-5
+    # In x_march mode, do not hard-fail immediately on low vx near inlet.
+    # Use short time-trace fallback so streamlines can escape local recirculation.
+    LOW_VX_USE_TIMETRACE_FALLBACK = True
+    LOW_VX_PATIENCE = 220
+    LOW_VX_FALLBACK_DT = 0.004
     # Seed/start x inset from left boundary to avoid hugging the wall.
-    SOURCE_SEED_X_INSET = 0.003
+    SOURCE_SEED_X_INSET = 0.006
+    # Keep a single fixed seed x (no inward re-seeding retries).
+    # Final seed x = x_left + SOURCE_SEED_X_INSET.
+    SOURCE_RESEED_X_OFFSETS = np.array([0.0], dtype=np.float32)
     # Around-source seed offsets for robustness; keep short for speed.
     SOURCE_SEED_DY = np.array([-0.004, 0.0, 0.004], dtype=np.float32)
     # Split seed profiles:
@@ -222,9 +237,14 @@ class LogicBoxConfig:
 
     # Outlet matching scale.
     OUTLET_SIGMA = 0.020
+    # Soft clearance target around source seed region (for anti-block reward term).
+    INLET_CLEARANCE = 0.012
 
     # Logic-box specific geometry controls (to avoid oversized/overlapped layouts).
+    # This MAX_R value is defined for BOX_X/Y_RANGE scale. When
+    # MAX_R_AUTO_SCALE_TO_BOUNDS=True, it scales with logic bounds size.
     MAX_R = 0.014
+    MAX_R_AUTO_SCALE_TO_BOUNDS = False
     EXIST_THRESHOLD = 0.0045
     # Hard floor on active radius in logic-box mode (when FORBID_ELIMINATION=True).
     MIN_ACTIVE_R = 0.0035
@@ -248,6 +268,9 @@ class LogicBoxConfig:
     W_WRONG_SIDE = 120.0
     W_OUTLET_POS = 60.0
     W_FORWARD = 18.0
+    # Penalize layouts that block source-seed neighborhood near inlet.
+    # Set to 0.0 to disable.
+    W_INLET_BLOCK = 0.0
     # Extra penalty when all design radii are zero (avoid trivial empty-layout local optimum).
     W_EMPTY_LAYOUT = 30.0
     # Streamline-to-target-route fitting (one-shot, no particle rollout).
@@ -292,6 +315,11 @@ class TrainingSettingConfig:
     # Optional forced target used when snapshotting free-layout centers to freeze.
     # Empty string means use environment's sampled target.
     AUTO_STAGE_SNAPSHOT_TARGET = ""
+    # One-stage shared-xy policy:
+    # - xy is optimized by a target-agnostic actor branch
+    # - r/omega/inflow is optimized by a target-aware actor branch
+    # Requires logic_box free-layout action shape.
+    SHARED_XY_ONE_STAGE_ENABLE = True
 
 
 class RankineSettingConfig:
@@ -305,6 +333,70 @@ def get_logic_box_ranges():
     if mode in {"global", "global_field", "full_field", "render_field", "world"}:
         return tuple(RenderSettingConfig.X_LIM), tuple(RenderSettingConfig.Y_LIM)
     return tuple(LogicBoxConfig.BOX_X_RANGE), tuple(LogicBoxConfig.BOX_Y_RANGE)
+
+
+def _rescale_from_reference(values, ref_range, out_range):
+    vals = np.asarray(values, dtype=np.float32).reshape(-1)
+    r0, r1 = float(ref_range[0]), float(ref_range[1])
+    o0, o1 = float(out_range[0]), float(out_range[1])
+    r_mid = 0.5 * (r0 + r1)
+    o_mid = 0.5 * (o0 + o1)
+    r_half = max(0.5 * abs(r1 - r0), 1e-8)
+    o_half = max(0.5 * abs(o1 - o0), 1e-8)
+    rel = (vals - r_mid) / r_half
+    out = o_mid + rel * o_half
+    lo, hi = (o0, o1) if o0 <= o1 else (o1, o0)
+    return np.clip(out, lo, hi).astype(np.float32)
+
+
+def get_logic_port_coordinates():
+    """
+    Return logic-box port coordinates adapted to current bounds.
+    """
+    (x0, x1), (y0, y1) = get_logic_box_ranges()
+    left_y = np.asarray(LogicBoxConfig.LEFT_PORT_Y, dtype=np.float32).reshape(-1)
+    right_y = np.asarray(LogicBoxConfig.RIGHT_PORT_Y, dtype=np.float32).reshape(-1)
+    top_x = np.array([float(LogicBoxConfig.TOP_PORT_X)], dtype=np.float32)
+    bot_x = np.array([float(LogicBoxConfig.BOTTOM_PORT_X)], dtype=np.float32)
+
+    if bool(getattr(LogicBoxConfig, "PORT_AUTO_SCALE_TO_BOUNDS", True)):
+        left_y = _rescale_from_reference(left_y, LogicBoxConfig.BOX_Y_RANGE, (y0, y1))
+        right_y = _rescale_from_reference(right_y, LogicBoxConfig.BOX_Y_RANGE, (y0, y1))
+        top_x = _rescale_from_reference(top_x, LogicBoxConfig.BOX_X_RANGE, (x0, x1))
+        bot_x = _rescale_from_reference(bot_x, LogicBoxConfig.BOX_X_RANGE, (x0, x1))
+
+    left_y = np.clip(left_y, min(y0, y1), max(y0, y1)).astype(np.float32)
+    right_y = np.clip(right_y, min(y0, y1), max(y0, y1)).astype(np.float32)
+    top_x = float(np.clip(top_x[0], min(x0, x1), max(x0, x1)))
+    bot_x = float(np.clip(bot_x[0], min(x0, x1), max(x0, x1)))
+    return {
+        "left_y": left_y,
+        "right_y": right_y,
+        "top_x": top_x,
+        "bottom_x": bot_x,
+    }
+
+
+def get_logic_max_radius():
+    """
+    Effective logic-box MAX_R after optional bound-based scaling.
+    """
+    base = float(getattr(LogicBoxConfig, "MAX_R", StokesCylinderConfig.MAX_R))
+    if bool(getattr(LogicBoxConfig, "MAX_R_AUTO_SCALE_TO_BOUNDS", True)):
+        (x0, x1), (y0, y1) = get_logic_box_ranges()
+        ref_x0, ref_x1 = float(LogicBoxConfig.BOX_X_RANGE[0]), float(LogicBoxConfig.BOX_X_RANGE[1])
+        ref_y0, ref_y1 = float(LogicBoxConfig.BOX_Y_RANGE[0]), float(LogicBoxConfig.BOX_Y_RANGE[1])
+        ref_span = min(abs(ref_x1 - ref_x0), abs(ref_y1 - ref_y0))
+        cur_span = min(abs(float(x1) - float(x0)), abs(float(y1) - float(y0)))
+        if ref_span > 1e-8:
+            base = base * (cur_span / ref_span)
+    return float(
+        np.clip(
+            base,
+            float(StokesCylinderConfig.MIN_R),
+            float(StokesCylinderConfig.MAX_R),
+        )
+    )
 
 
 def get_logic_multi_route_pairs():

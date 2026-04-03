@@ -19,6 +19,7 @@ from config import (
 )
 from envs.FluidEnv import FluidEnv
 from envs.Renderer import FluidRenderer
+from envs.SharedXYPolicy import SharedXYActorCriticPolicy  # noqa: F401
 from envs.Wrapper import FollowerEnv, TaskContext
 
 
@@ -51,22 +52,36 @@ def _append_run_alias(tag: str) -> str:
     return f"{tag}__{safe}"
 
 
+def _logic_bounds_suffix() -> str:
+    mode = str(getattr(LogicBoxConfig, "BOUNDS_MODE", "local_box")).strip().lower()
+    if mode in {"global", "global_field", "full_field", "render_field", "world"}:
+        return "bnd_global"
+    return "bnd_local"
+
+
 def build_task_tag(layout_mode: str) -> str:
     base_mode, _ = parse_layout_mode(layout_mode)
     if base_mode == "logic_box_layout":
+        bounds_suffix = _logic_bounds_suffix()
         route_mode = str(getattr(LogicBoxConfig, "ROUTE_MODE", "single")).strip().lower()
         if route_mode in {"multi", "multi_map", "multi_route", "mapping"}:
             pairs = get_logic_multi_route_pairs()
             pair_tag = "_".join([f"{str(s).upper()}to{str(t).upper()}" for s, t in pairs])
-            return _append_run_alias(f"{layout_mode}_{TrainingSettingConfig.PATH_TYPE}_multi_{pair_tag}")
+            return _append_run_alias(
+                f"{layout_mode}_{TrainingSettingConfig.PATH_TYPE}_multi_{pair_tag}__{bounds_suffix}"
+            )
         if route_mode in {"single_multi_target", "single_source_multi_target", "one_to_many", "one_to_three"}:
             src = str(getattr(LogicBoxConfig, "SOURCE_PORT", "L1")).upper()
             tgt_set = getattr(LogicBoxConfig, "TARGET_PORT_SET", ["R0", "R1", "R2"])
             tgt_tag = "".join([str(t).upper() for t in tgt_set])
-            return _append_run_alias(f"{layout_mode}_{TrainingSettingConfig.PATH_TYPE}_{src}_to_{tgt_tag}")
+            return _append_run_alias(
+                f"{layout_mode}_{TrainingSettingConfig.PATH_TYPE}_{src}_to_{tgt_tag}__{bounds_suffix}"
+            )
         src = str(getattr(LogicBoxConfig, "SOURCE_PORT", "L1")).upper()
         tgt = str(getattr(LogicBoxConfig, "TARGET_PORT", "R1")).upper()
-        return _append_run_alias(f"{layout_mode}_{TrainingSettingConfig.PATH_TYPE}_{src}_to_{tgt}")
+        return _append_run_alias(
+            f"{layout_mode}_{TrainingSettingConfig.PATH_TYPE}_{src}_to_{tgt}__{bounds_suffix}"
+        )
     return _append_run_alias(f"{layout_mode}_{TrainingSettingConfig.PATH_TYPE}")
 
 

@@ -17,7 +17,11 @@ class FluidRenderer:
         height: int = RenderSettingConfig.HEIGHT,
         dpi: int = RenderSettingConfig.DPI
     ):
-        self.fig, self.ax = plt.subplots(figsize=(width / dpi, height / dpi), dpi=dpi)
+        self.fig, self.ax = plt.subplots(
+            figsize=(width / dpi, height / dpi),
+            dpi=dpi,
+            constrained_layout=True,
+        )
         self.canvas = FigureCanvas(self.fig)
         self.ax.set_aspect("equal")
 
@@ -99,12 +103,13 @@ class FluidRenderer:
             )
             self.ax.text(
                 cx,
-                cy + 0.01,
+                cy + 0.012,
                 f"inflow=({inflow_u:.3f},{inflow_v:.3f})",
                 fontsize=8,
                 color="#111827",
                 ha="left",
                 va="bottom",
+                bbox=dict(boxstyle="round,pad=0.16", fc="white", ec="none", alpha=0.75),
                 zorder=6,
             )
 
@@ -125,16 +130,23 @@ class FluidRenderer:
                 zorder=2
             )
             self.ax.add_patch(circ)
-            self.ax.text(
-                cyl_x[i],
-                cyl_y[i],
-                f"{i}",
-                fontsize=6,
-                color="black",
-                ha="center",
-                va="center",
-                weight="bold"
-            )
+            if float(cyl_r[i]) >= 0.0035:
+                ang = np.deg2rad(float((i * 137.507764) % 360.0))
+                rr = max(0.35 * float(cyl_r[i]), 0.0018)
+                tx = float(cyl_x[i] + rr * np.cos(ang))
+                ty = float(cyl_y[i] + rr * np.sin(ang))
+                self.ax.text(
+                    tx,
+                    ty,
+                    f"{i}",
+                    fontsize=6,
+                    color="black",
+                    ha="center",
+                    va="center",
+                    weight="bold",
+                    bbox=dict(boxstyle="round,pad=0.10", fc="white", ec="none", alpha=0.60),
+                    zorder=6,
+                )
 
         if follower_path is not None and len(follower_path) > 1:
             xs = [p[0] for p in follower_path]
@@ -214,73 +226,115 @@ class FluidRenderer:
                 elif name == tgt and len(tgt_set) == 0:
                     color = "#dc2626"
                 self.ax.plot(px, py, marker="o", ms=4, color=color, zorder=6)
+                x0, x1 = self.ax.get_xlim()
+                y0, y1 = self.ax.get_ylim()
+                dx = 0.012 * (x1 - x0)
+                dy = 0.012 * (y1 - y0)
                 if info.get("side") == "left":
-                    self.ax.text(px - 0.008, py, name, fontsize=7, ha="right", va="center")
+                    self.ax.text(
+                        px + dx, py, name, fontsize=7, ha="left", va="center",
+                        bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.70),
+                        zorder=7,
+                    )
                 elif info.get("side") == "right":
-                    self.ax.text(px + 0.008, py, name, fontsize=7, ha="left", va="center")
+                    self.ax.text(
+                        px - dx, py, name, fontsize=7, ha="right", va="center",
+                        bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.70),
+                        zorder=7,
+                    )
                 elif info.get("side") == "top":
-                    self.ax.text(px, py + 0.008, name, fontsize=7, ha="center", va="bottom")
+                    self.ax.text(
+                        px, py - dy, name, fontsize=7, ha="center", va="top",
+                        bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.70),
+                        zorder=7,
+                    )
                 else:
-                    self.ax.text(px, py - 0.008, name, fontsize=7, ha="center", va="top")
+                    self.ax.text(
+                        px, py + dy, name, fontsize=7, ha="center", va="bottom",
+                        bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.70),
+                        zorder=7,
+                    )
 
             seed_points = logic_box.get("seed_points", [])
             for i, sp in enumerate(seed_points):
                 sx, sy = float(sp[0]), float(sp[1])
                 self.ax.plot(sx, sy, marker="D", ms=4, color="#0f766e", zorder=6)
-                self.ax.text(sx - 0.006, sy + 0.004, f"s{i}", fontsize=7, color="#0f766e")
+                self.ax.text(
+                    sx + 0.004,
+                    sy + 0.004,
+                    f"s{i}",
+                    fontsize=7,
+                    color="#0f766e",
+                    bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.75),
+                    zorder=7,
+                )
 
             seed_streamlines = logic_box.get("seed_streamlines", [])
             seed_colors = ["#0ea5e9", "#f59e0b", "#22c55e", "#a855f7", "#ef4444"]
+            x0_ax, x1_ax = self.ax.get_xlim()
+            y0_ax, y1_ax = self.ax.get_ylim()
+            seg_len = 0.035 * max(float(x1_ax) - float(x0_ax), float(y1_ax) - float(y0_ax))
             for i, tr in enumerate(seed_streamlines):
                 hist = tr.get("history", [])
-                if not isinstance(hist, (list, tuple)) or len(hist) < 2:
-                    continue
-                arr = np.asarray(hist, dtype=np.float32)
-                if arr.ndim != 2 or arr.shape[1] < 2:
-                    continue
                 color = seed_colors[i % len(seed_colors)]
                 if bool(tr.get("collision", False)):
                     color = "#dc2626"
-                self.ax.plot(
-                    arr[:, 0],
-                    arr[:, 1],
-                    linestyle="-.",
-                    lw=1.3,
-                    color=color,
-                    alpha=0.95,
-                    zorder=5,
-                )
-                self.ax.plot(
-                    float(arr[0, 0]),
-                    float(arr[0, 1]),
-                    marker="D",
-                    ms=4,
-                    color=color,
-                    zorder=6,
-                )
-                self.ax.plot(
-                    float(arr[-1, 0]),
-                    float(arr[-1, 1]),
-                    marker="x",
-                    ms=5,
-                    color=color,
-                    zorder=6,
-                )
-            if len(src_set) > 0 and len(tgt_set) > 0:
-                route_text = " | ".join(
-                    [f"{str(p[0]).upper()}->{str(p[1]).upper()}" for p in route_pairs if isinstance(p, (list, tuple)) and len(p) == 2]
-                )
-                if len(route_text) > 0:
-                    self.ax.text(
-                        bx0,
-                        by1 + 0.008,
-                        route_text,
-                        fontsize=7,
-                        color="#0f172a",
-                        ha="left",
-                        va="bottom",
-                        zorder=7,
+                arr = None
+                if isinstance(hist, (list, tuple)) and len(hist) >= 2:
+                    arr = np.asarray(hist, dtype=np.float32)
+                    if arr.ndim != 2 or arr.shape[1] < 2:
+                        arr = None
+
+                if arr is not None and arr.shape[0] >= 2:
+                    self.ax.plot(
+                        arr[:, 0],
+                        arr[:, 1],
+                        linestyle="-.",
+                        lw=1.3,
+                        color=color,
+                        alpha=0.95,
+                        zorder=5,
                     )
+                    self.ax.plot(
+                        float(arr[0, 0]),
+                        float(arr[0, 1]),
+                        marker="D",
+                        ms=4,
+                        color=color,
+                        zorder=6,
+                    )
+                    self.ax.plot(
+                        float(arr[-1, 0]),
+                        float(arr[-1, 1]),
+                        marker="x",
+                        ms=5,
+                        color=color,
+                        zorder=6,
+                    )
+                else:
+                    seed = tr.get("seed", None)
+                    if isinstance(seed, (list, tuple)) and len(seed) >= 2:
+                        sx, sy = float(seed[0]), float(seed[1])
+                        ivx = float(tr.get("init_vx", 0.0))
+                        ivy = float(tr.get("init_vy", 0.0))
+                        vn = float(np.hypot(ivx, ivy))
+                        if vn > 1e-12:
+                            ex = sx + (ivx / vn) * seg_len
+                            ey = sy + (ivy / vn) * seg_len
+                        else:
+                            ex = sx + 0.6 * seg_len
+                            ey = sy
+                        self.ax.plot(
+                            [sx, ex],
+                            [sy, ey],
+                            linestyle=":",
+                            lw=1.5,
+                            color=color,
+                            alpha=0.95,
+                            zorder=5,
+                        )
+                        self.ax.plot(sx, sy, marker="D", ms=4, color=color, zorder=6)
+                        self.ax.plot(ex, ey, marker="x", ms=5, color=color, zorder=6)
 
         px, py = scene["particle"]["x"], scene["particle"]["y"]
         self.ax.plot(px, py, "ro", ms=5, zorder=5)
@@ -297,7 +351,7 @@ class FluidRenderer:
             )
 
         if title:
-            self.ax.set_title(title, fontsize=9)
+            self.ax.set_title(title, fontsize=9, pad=10)
 
         self.canvas.draw()
         w, h = self.fig.canvas.get_width_height()

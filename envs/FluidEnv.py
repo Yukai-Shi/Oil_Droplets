@@ -7,6 +7,7 @@ from config import (
     Gate3LevelConfig,
     GlobalOmegaControlConfig,
     get_logic_box_ranges,
+    get_logic_max_radius,
     InflowConfig,
     LayoutModeConfig,
     LogicBoxConfig,
@@ -281,7 +282,7 @@ class FluidEnv:
                     0.5 * (float(y1) - float(y0)) - margin,
                 ),
             )
-            r_eff_high = min(float(r_high), float(max_box_r), float(getattr(LogicBoxConfig, "MAX_R", r_high)))
+            r_eff_high = min(float(r_high), float(max_box_r), float(get_logic_max_radius()))
             logic_forbid_elimination = bool(getattr(LogicBoxConfig, "FORBID_ELIMINATION", False))
             logic_min_active_r = max(float(r_low), float(getattr(LogicBoxConfig, "MIN_ACTIVE_R", r_low)))
             if self.logic_fixed_layout:

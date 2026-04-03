@@ -7,12 +7,25 @@ import numpy as np
 from config import (
     FixedGrid3x3Config,
     Gate3LevelConfig,
+    get_logic_box_ranges,
+    get_logic_port_coordinates,
     LayoutModeConfig,
     LogicBoxConfig,
     RenderSettingConfig,
     StokesCylinderConfig,
     TrainingSettingConfig,
 )
+
+
+def parse_layout_mode(layout_mode: str):
+    mode = str(layout_mode)
+    if mode.endswith("_inflow_u_fixed"):
+        return mode[:-15], True
+    if mode.endswith("_inflow_u"):
+        return mode[:-9], True
+    if mode.endswith("_inflow"):
+        return mode[:-7], True
+    return mode, False
 
 
 def generate_path(path_type: str, steps: int) -> np.ndarray:
@@ -150,16 +163,16 @@ def generate_path(path_type: str, steps: int) -> np.ndarray:
         xs = path[:, 0]
         ys = path[:, 1]
     elif path_type == "logic_route":
-        x0_box, x1_box = LogicBoxConfig.BOX_X_RANGE
-        y0_box, y1_box = LogicBoxConfig.BOX_Y_RANGE
+        (x0_box, x1_box), (y0_box, y1_box) = get_logic_box_ranges()
+        p = get_logic_port_coordinates()
 
         ports = {}
-        for i, yy in enumerate(np.asarray(LogicBoxConfig.LEFT_PORT_Y, dtype=np.float32)):
+        for i, yy in enumerate(np.asarray(p["left_y"], dtype=np.float32)):
             ports[f"L{i}"] = ("left", np.array([x0_box, float(yy)], dtype=np.float32))
-        for i, yy in enumerate(np.asarray(LogicBoxConfig.RIGHT_PORT_Y, dtype=np.float32)):
+        for i, yy in enumerate(np.asarray(p["right_y"], dtype=np.float32)):
             ports[f"R{i}"] = ("right", np.array([x1_box, float(yy)], dtype=np.float32))
-        ports["T0"] = ("top", np.array([float(LogicBoxConfig.TOP_PORT_X), y1_box], dtype=np.float32))
-        ports["B0"] = ("bottom", np.array([float(LogicBoxConfig.BOTTOM_PORT_X), y0_box], dtype=np.float32))
+        ports["T0"] = ("top", np.array([float(p["top_x"]), y1_box], dtype=np.float32))
+        ports["B0"] = ("bottom", np.array([float(p["bottom_x"]), y0_box], dtype=np.float32))
 
         src = str(getattr(LogicBoxConfig, "SOURCE_PORT", "L1")).upper()
         tgt = str(getattr(LogicBoxConfig, "TARGET_PORT", "R1")).upper()
@@ -211,7 +224,7 @@ def build_cylinder_layout(
     free_random_layout: bool,
     seed: int,
 ):
-    base_mode = layout_mode[:-7] if layout_mode.endswith("_inflow") else layout_mode
+    base_mode, _ = parse_layout_mode(layout_mode)
     r_min = StokesCylinderConfig.MIN_R
     r_max = StokesCylinderConfig.MAX_R
     r = float(np.clip(preview_radius, r_min, r_max))
@@ -263,8 +276,7 @@ def build_cylinder_layout(
         if not free_random_layout:
             return np.array([], dtype=np.float32), np.array([], dtype=np.float32), np.array([], dtype=np.float32)
         rng = np.random.default_rng(seed)
-        x0, x1 = LogicBoxConfig.BOX_X_RANGE
-        y0, y1 = LogicBoxConfig.BOX_Y_RANGE
+        (x0, x1), (y0, y1) = get_logic_box_ranges()
         x = rng.uniform(x0, x1, size=n).astype(np.float32)
         y = rng.uniform(y0, y1, size=n).astype(np.float32)
         rr = np.full(n, r, dtype=np.float32)
@@ -321,10 +333,10 @@ def plot_scene(
         )
     )
 
-    base_mode = layout_mode[:-7] if layout_mode.endswith("_inflow") else layout_mode
+    base_mode, _ = parse_layout_mode(layout_mode)
     if base_mode == "logic_box_layout":
-        bx0, bx1 = LogicBoxConfig.BOX_X_RANGE
-        by0, by1 = LogicBoxConfig.BOX_Y_RANGE
+        (bx0, bx1), (by0, by1) = get_logic_box_ranges()
+        p = get_logic_port_coordinates()
         ax.add_patch(
             plt.Rectangle(
                 (bx0, by0),
@@ -338,16 +350,16 @@ def plot_scene(
                 label="logic box",
             )
         )
-        for i, yy in enumerate(np.asarray(LogicBoxConfig.LEFT_PORT_Y, dtype=np.float32)):
+        for i, yy in enumerate(np.asarray(p["left_y"], dtype=np.float32)):
             ax.plot([bx0], [float(yy)], marker="o", ms=4, color="#1f2937")
             ax.text(bx0 - 0.01, float(yy), f"L{i}", fontsize=7, ha="right", va="center")
-        for i, yy in enumerate(np.asarray(LogicBoxConfig.RIGHT_PORT_Y, dtype=np.float32)):
+        for i, yy in enumerate(np.asarray(p["right_y"], dtype=np.float32)):
             ax.plot([bx1], [float(yy)], marker="o", ms=4, color="#1f2937")
             ax.text(bx1 + 0.01, float(yy), f"R{i}", fontsize=7, ha="left", va="center")
-        ax.plot([float(LogicBoxConfig.TOP_PORT_X)], [by1], marker="o", ms=4, color="#1f2937")
-        ax.text(float(LogicBoxConfig.TOP_PORT_X), by1 + 0.01, "T0", fontsize=7, ha="center", va="bottom")
-        ax.plot([float(LogicBoxConfig.BOTTOM_PORT_X)], [by0], marker="o", ms=4, color="#1f2937")
-        ax.text(float(LogicBoxConfig.BOTTOM_PORT_X), by0 - 0.01, "B0", fontsize=7, ha="center", va="top")
+        ax.plot([float(p["top_x"])], [by1], marker="o", ms=4, color="#1f2937")
+        ax.text(float(p["top_x"]), by1 + 0.01, "T0", fontsize=7, ha="center", va="bottom")
+        ax.plot([float(p["bottom_x"])], [by0], marker="o", ms=4, color="#1f2937")
+        ax.text(float(p["bottom_x"]), by0 - 0.01, "B0", fontsize=7, ha="center", va="top")
 
     ax.plot(path[:, 0], path[:, 1], "-", lw=2.0, color="#1f77b4", label=f"path: {path_type}")
     ax.scatter(path[0, 0], path[0, 1], s=44, color="green", label="start", zorder=4)
@@ -448,7 +460,7 @@ def main():
         f"layout_mode={args.layout_mode} | cylinders={len(cyl_x)} | "
         f"preview_radius={float(args.preview_radius):.4f}"
     )
-    base_mode = args.layout_mode[:-7] if args.layout_mode.endswith("_inflow") else args.layout_mode
+    base_mode, _ = parse_layout_mode(args.layout_mode)
     if base_mode == "free_layout" and not args.free_random_layout:
         print("free_layout default reset has no fixed cylinder positions; use --free-random-layout to preview one sample.")
     if base_mode == "gate3_layout" and not args.free_random_layout:

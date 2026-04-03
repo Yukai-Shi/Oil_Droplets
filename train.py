@@ -17,9 +17,10 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import EvalCallback
 
-from envs.Wrapper import TaskContext, FollowerEnv, logic_target_port_set
+from envs.Wrapper import TaskContext, FollowerEnv, logic_box_ports, logic_target_port_set
 from envs.FluidEnv import FluidEnv
 from envs.Renderer import FluidRenderer
+from envs.SharedXYPolicy import SharedXYActorCriticPolicy
 from utils.reseed import reseed_everything
 from config import (
     LayoutModeConfig,
@@ -57,22 +58,30 @@ def _append_run_alias(tag: str) -> str:
     return f"{tag}__{safe}"
 
 
+def _logic_bounds_suffix() -> str:
+    mode = str(getattr(LogicBoxConfig, "BOUNDS_MODE", "local_box")).strip().lower()
+    if mode in {"global", "global_field", "full_field", "render_field", "world"}:
+        return "bnd_global"
+    return "bnd_local"
+
+
 def build_task_tag(layout_mode: str) -> str:
     base_mode, _ = parse_layout_mode(layout_mode)
     if base_mode == "logic_box_layout":
+        bounds_suffix = _logic_bounds_suffix()
         route_mode = str(getattr(LogicBoxConfig, "ROUTE_MODE", "single")).strip().lower()
         if route_mode in {"multi", "multi_map", "multi_route", "mapping"}:
             pairs = get_logic_multi_route_pairs()
             pair_tag = "_".join([f"{str(s).upper()}to{str(t).upper()}" for s, t in pairs])
-            return _append_run_alias(f"{layout_mode}_{PATH_TYPE}_multi_{pair_tag}")
+            return _append_run_alias(f"{layout_mode}_{PATH_TYPE}_multi_{pair_tag}__{bounds_suffix}")
         if route_mode in {"single_multi_target", "single_source_multi_target", "one_to_many", "one_to_three"}:
             src = str(getattr(LogicBoxConfig, "SOURCE_PORT", "L1")).upper()
             tgt_set = getattr(LogicBoxConfig, "TARGET_PORT_SET", ["R0", "R1", "R2"])
             tgt_tag = "".join([str(t).upper() for t in tgt_set])
-            return _append_run_alias(f"{layout_mode}_{PATH_TYPE}_{src}_to_{tgt_tag}")
+            return _append_run_alias(f"{layout_mode}_{PATH_TYPE}_{src}_to_{tgt_tag}__{bounds_suffix}")
         src = str(getattr(LogicBoxConfig, "SOURCE_PORT", "L1")).upper()
         tgt = str(getattr(LogicBoxConfig, "TARGET_PORT", "R1")).upper()
-        return _append_run_alias(f"{layout_mode}_{PATH_TYPE}_{src}_to_{tgt}")
+        return _append_run_alias(f"{layout_mode}_{PATH_TYPE}_{src}_to_{tgt}__{bounds_suffix}")
     return _append_run_alias(f"{layout_mode}_{PATH_TYPE}")
 
 
@@ -81,7 +90,7 @@ TOTAL_TIMESTEPS = 1_000_00000
 SAVE_DIR = "models"
 BEST_ROOT_DIR = os.path.join(SAVE_DIR, "best")
 TASK_BEST_DIR = os.path.join(BEST_ROOT_DIR, TASK_TAG)
-EVAL_FREQ = 80000
+EVAL_FREQ = 20000
 N_EVAL_EPISODES = 1
 PATIENCE_EVALS = 50
 LOG_INTERVAL = 20
@@ -95,6 +104,7 @@ INFLOW_WARMUP_RATIO = float(getattr(TrainingSettingConfig, "INFLOW_WARMUP_RATIO"
 AUTO_STAGE_ENABLE = bool(getattr(TrainingSettingConfig, "AUTO_STAGE_ENABLE", False))
 AUTO_STAGE_EVALS_PER_PHASE = int(getattr(TrainingSettingConfig, "AUTO_STAGE_EVALS_PER_PHASE", 3))
 AUTO_STAGE_SNAPSHOT_TARGET = str(getattr(TrainingSettingConfig, "AUTO_STAGE_SNAPSHOT_TARGET", "")).strip().upper()
+SHARED_XY_ONE_STAGE_ENABLE = bool(getattr(TrainingSettingConfig, "SHARED_XY_ONE_STAGE_ENABLE", False))
 
 PPO_CFG = dict(
     policy="MlpPolicy",
@@ -172,6 +182,15 @@ def parse_train_args():
             "Empty uses environment sampled target."
         ),
     )
+    parser.add_argument(
+        "--shared-xy-one-stage-enable",
+        action="store_true",
+        default=SHARED_XY_ONE_STAGE_ENABLE,
+        help=(
+            "Enable one-stage shared-xy policy: x/y branch is target-agnostic, "
+            "r/omega/inflow branch is target-aware."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -230,30 +249,22 @@ def _build_compact_eval_title(reward_value: float, info0: dict, base_mode: str) 
     title = f"One-Shot Eval | R:{float(reward_value):.2f}"
     if base_mode == "logic_box_layout":
         lfit = info0.get("logic_path_fit_error", None)
-        lcov = info0.get("logic_path_cover_penalty", None)
         lmis = info0.get("logic_miss_ratio", None)
-        lws = info0.get("logic_wrong_side_ratio", None)
         lout = info0.get("logic_outlet_error", None)
         dead_cnt = info0.get("inactive_count", None)
         total_cnt = info0.get("total_count", None)
-        killed_eps = info0.get("killed_eps", None)
         ltgt = info0.get("logic_episode_target_port", info0.get("logic_target_port", None))
         if ltgt is not None:
             title += f" | tgt:{str(ltgt).upper()}"
+        # Keep title short to avoid overlap with in-axes annotations.
+        if lfit is not None:
+            title += f" | fit:{float(lfit):.3f}"
+        if lmis is not None:
+            title += f" | miss:{float(lmis):.2f}"
+        if lout is not None:
+            title += f" | out:{float(lout):.2f}"
         if dead_cnt is not None and total_cnt is not None:
             title += f" | dead:{int(dead_cnt)}/{int(total_cnt)}"
-        if killed_eps is not None:
-            title += f" | eps:{float(killed_eps):.1e}"
-        if lfit is not None:
-            title += f" | lfit:{float(lfit):.3f}"
-        if lcov is not None:
-            title += f" | lcov:{float(lcov):.2f}"
-        if lmis is not None:
-            title += f" | lmis:{float(lmis):.2f}"
-        if lws is not None:
-            title += f" | lws:{float(lws):.2f}"
-        if lout is not None:
-            title += f" | lout:{float(lout):.2f}"
         return title
 
     if base_mode == "gate3_layout":
@@ -328,6 +339,7 @@ def render_evaluation_run(
     logic_wrong_side = info0.get("logic_wrong_side_ratio", None)
     logic_outlet_err = info0.get("logic_outlet_error", None)
     logic_forward_pen = info0.get("logic_forward_penalty", None)
+    logic_inlet_block = info0.get("logic_inlet_block_penalty", None)
     logic_path_fit = info0.get("logic_path_fit_error", None)
     logic_path_cover = info0.get("logic_path_cover_penalty", None)
     logic_src = info0.get("logic_source_port", None)
@@ -370,13 +382,11 @@ def render_evaluation_run(
     base_mode, _ = parse_layout_mode(layout_mode)
     if base_mode == "logic_box_layout":
         (bx0, bx1), (by0, by1) = get_logic_box_ranges()
-        ports = {}
-        for i, yy in enumerate(np.asarray(LogicBoxConfig.LEFT_PORT_Y, dtype=np.float32)):
-            ports[f"L{i}"] = {"side": "left", "xy": [float(bx0), float(yy)]}
-        for i, yy in enumerate(np.asarray(LogicBoxConfig.RIGHT_PORT_Y, dtype=np.float32)):
-            ports[f"R{i}"] = {"side": "right", "xy": [float(bx1), float(yy)]}
-        ports["T0"] = {"side": "top", "xy": [float(LogicBoxConfig.TOP_PORT_X), float(by1)]}
-        ports["B0"] = {"side": "bottom", "xy": [float(LogicBoxConfig.BOTTOM_PORT_X), float(by0)]}
+        raw_ports = logic_box_ports()
+        ports = {
+            k: {"side": str(v[0]), "xy": [float(v[1][0]), float(v[1][1])]}
+            for k, v in raw_ports.items()
+        }
         seed_offsets = np.asarray(
             getattr(LogicBoxConfig, "EVAL_SOURCE_SEED_DY", getattr(LogicBoxConfig, "SOURCE_SEED_DY", [0.0])),
             dtype=np.float32,
@@ -442,7 +452,7 @@ def render_evaluation_run(
         f"gate_ord={gate_lane_order}, gate_dir={gate_dir_pen}, gate_rev={gate_rev_ratio}, "
         f"gate_target={gate_lane_target}, "
         f"logic_miss={logic_miss}, logic_col={logic_collision}, logic_wrong={logic_wrong_side}, "
-        f"logic_out={logic_outlet_err}, logic_fwd={logic_forward_pen}, "
+        f"logic_out={logic_outlet_err}, logic_fwd={logic_forward_pen}, logic_inlet={logic_inlet_block}, "
         f"logic_fit={logic_path_fit}, logic_cov={logic_path_cover}, "
         f"inactive={inactive_count}/{total_count}, killed_eps={killed_eps}, zero_ratio={zero_radius_ratio}, "
         f"inflow_reg={inflow_reg_pen}, "
@@ -463,19 +473,15 @@ def render_evaluation_run(
         draw_flow=True,
     )
 
-    task_tag = build_task_tag(layout_mode)
-    out_base = os.path.normpath(output_dir)
-    if os.path.basename(out_base) == task_tag:
-        run_group_dir = output_dir
-    else:
-        run_group_dir = os.path.join(output_dir, task_tag)
+    # Keep output path deterministic: always write under provided output_dir.
+    run_group_dir = os.path.normpath(output_dir)
     png_dir = os.path.join(run_group_dir, "frames")
     os.makedirs(png_dir, exist_ok=True)
 
     png_path = os.path.join(png_dir, f"{filename_prefix}final.png")
 
     imageio.imwrite(png_path, final_frame)
-    print(f"[Visualization] Final frame saved to {png_path}")
+    print(f"[Visualization] Final frame saved to {os.path.abspath(png_path)}")
 
     if SAVE_EVAL_GIF:
         gif_dir = os.path.join(run_group_dir, "gifs")
@@ -633,10 +639,47 @@ class EvalCallbackWithEarlyStop(EvalCallback):
                 model_path=eval_model_path,
                 vecnorm_path=eval_vn_path,
                 output_dir=self.best_model_save_path,
-                filename_prefix=f"eval_{TASK_TAG}_t{self.num_timesteps}_{tgt}_",
+                filename_prefix=f"eval_t{self.num_timesteps}_{tgt}_",
                 layout_mode=LAYOUT_MODE,
                 forced_target_port=str(tgt).upper(),
             )
+
+    def _evaluate_forced_target_reward(self, target_port: str):
+        tgt = str(target_port).strip().upper()
+        try:
+            self.eval_env.env_method("set_logic_forced_target_port", tgt)
+        except Exception:
+            pass
+        obs = self.eval_env.reset()
+        action, _ = self.model.predict(obs, deterministic=True)
+        _, reward, _, info = self.eval_env.step(action)
+        info0 = info[0] if isinstance(info, (list, tuple)) else info
+        r = float(reward[0]) if isinstance(reward, (list, tuple, np.ndarray)) else float(reward)
+        return r, info0
+
+    def _evaluate_single_multi_target_metric(self):
+        targets = [str(t).upper() for t in logic_target_port_set()]
+        if len(targets) == 0:
+            return float("-inf"), float("-inf"), {}
+        rewards = []
+        details = {}
+        try:
+            for tgt in targets:
+                r, info0 = self._evaluate_forced_target_reward(tgt)
+                rewards.append(float(r))
+                details[tgt] = {
+                    "reward": float(r),
+                    "miss": float(info0.get("logic_miss_ratio", 0.0)),
+                    "out": float(info0.get("logic_outlet_error", 0.0)),
+                    "fit": float(info0.get("logic_path_fit_error", 0.0)),
+                }
+        finally:
+            try:
+                self.eval_env.env_method("set_logic_forced_target_port", None)
+            except Exception:
+                pass
+        rewards_np = np.asarray(rewards, dtype=np.float32)
+        return float(np.min(rewards_np)), float(np.mean(rewards_np)), details
 
     def _on_step(self) -> bool:
         self._maybe_update_inflow_control()
@@ -656,12 +699,42 @@ class EvalCallbackWithEarlyStop(EvalCallback):
                 except Exception as exc:
                     print(f"[Visualization] eval triplet render skipped: {exc}")
 
-            if self.best_mean_reward > self._best_mean_reward:
-                self._best_mean_reward = self.best_mean_reward
+            metric_value = float(self.best_mean_reward)
+            metric_name = "eval_mean"
+            if single_multi_target_mode:
+                try:
+                    mt_min, mt_mean, mt_detail = self._evaluate_single_multi_target_metric()
+                    metric_mode = str(
+                        getattr(LogicBoxConfig, "MULTI_TARGET_BEST_METRIC", "min")
+                    ).strip().lower()
+                    if metric_mode in {"mean", "avg", "average"}:
+                        metric_value = float(mt_mean)
+                        metric_name = "multi_target_mean"
+                    else:
+                        metric_value = float(mt_min)
+                        metric_name = "multi_target_min"
+                    brief = " | ".join(
+                        [
+                            f"{k}:R={v['reward']:.2f},mis={v['miss']:.2f},out={v['out']:.2f}"
+                            for k, v in mt_detail.items()
+                        ]
+                    )
+                    print(
+                        f"[MultiTargetEval] {metric_name}={metric_value:.2f} "
+                        f"(min={mt_min:.2f}, mean={mt_mean:.2f}) | {brief}"
+                    )
+                except Exception as exc:
+                    print(f"[MultiTargetEval] metric fallback to eval_mean: {exc}")
+
+            if metric_value > self._best_mean_reward:
+                self._best_mean_reward = float(metric_value)
                 self.no_improve_count = 0
 
                 vn_path = os.path.join(self.best_model_save_path, "vecnormalize_best.pkl")
+                # Save best by our selected metric (important for multi-target mode).
+                self.model.save(os.path.join(self.best_model_save_path, "best_model"))
                 self.training_env.save(vn_path)
+                print(f"[Best] updated by {metric_name}={metric_value:.2f}")
                 if SAVE_BEST_PREVIEW:
                     if single_multi_target_mode:
                         targets = [str(t).upper() for t in logic_target_port_set()]
@@ -671,7 +744,7 @@ class EvalCallbackWithEarlyStop(EvalCallback):
                                     model_path=os.path.join(self.best_model_save_path, "best_model.zip"),
                                     vecnorm_path=vn_path,
                                     output_dir=self.best_model_save_path,
-                                    filename_prefix=f"best_{TASK_TAG}_t{self.num_timesteps}_{tgt}_",
+                                    filename_prefix=f"best_t{self.num_timesteps}_{tgt}_",
                                     layout_mode=LAYOUT_MODE,
                                     forced_target_port=str(tgt).upper(),
                                 )
@@ -683,7 +756,7 @@ class EvalCallbackWithEarlyStop(EvalCallback):
                                 model_path=os.path.join(self.best_model_save_path, "best_model.zip"),
                                 vecnorm_path=vn_path,
                                 output_dir=self.best_model_save_path,
-                                filename_prefix=f"best_{TASK_TAG}_t{self.num_timesteps}_",
+                                filename_prefix=f"best_t{self.num_timesteps}_",
                                 layout_mode=LAYOUT_MODE,
                             )
                         except Exception as exc:
@@ -725,6 +798,7 @@ if __name__ == "__main__":
     AUTO_STAGE_ENABLE = bool(args.auto_stage_enable)
     AUTO_STAGE_EVALS_PER_PHASE = max(1, int(args.auto_stage_evals_per_phase))
     AUTO_STAGE_SNAPSHOT_TARGET = str(args.auto_stage_snapshot_target).strip().upper()
+    SHARED_XY_ONE_STAGE_ENABLE = bool(args.shared_xy_one_stage_enable)
 
     LayoutModeConfig.LAYOUT_MODE = LAYOUT_MODE
     TrainingSettingConfig.PATH_TYPE = PATH_TYPE
@@ -733,6 +807,13 @@ if __name__ == "__main__":
         LogicBoxConfig.ROUTE_MODE = str(args.logic_route_mode).strip().lower()
         LogicBoxConfig.SOURCE_PORT = str(args.source_port).upper()
         LogicBoxConfig.TARGET_PORT = str(args.target_port).upper()
+        if SHARED_XY_ONE_STAGE_ENABLE:
+            LogicBoxConfig.FIXED_LAYOUT_ENABLE = False
+            LogicBoxConfig.KEEP_XY_ACTION_WHEN_FIXED = True
+            # Shared-xy one-stage conflicts conceptually with phase switching.
+            AUTO_STAGE_ENABLE = False
+            BOOTSTRAP_FIXED_LAYOUT = False
+            print("[TrainConfig] shared-xy one-stage enabled: force FIXED_LAYOUT_ENABLE=False, disable auto-stage.")
         if AUTO_STAGE_ENABLE and (not bool(getattr(LogicBoxConfig, "KEEP_XY_ACTION_WHEN_FIXED", False))):
             LogicBoxConfig.KEEP_XY_ACTION_WHEN_FIXED = True
             print("[TrainConfig] auto-enable KEEP_XY_ACTION_WHEN_FIXED=True for auto stage switching.")
@@ -779,6 +860,7 @@ if __name__ == "__main__":
         f"init_model={'yes' if len(INIT_MODEL)>0 else 'no'} "
         f"init_vecnorm={'yes' if len(INIT_VECNORM)>0 else 'no'} "
         f"reset_ts={RESET_NUM_TIMESTEPS} "
+        f"shared_xy_one_stage={SHARED_XY_ONE_STAGE_ENABLE} "
         f"auto_stage={AUTO_STAGE_ENABLE} auto_stage_evals={AUTO_STAGE_EVALS_PER_PHASE} "
         f"auto_stage_tgt={AUTO_STAGE_SNAPSHOT_TARGET or 'env'} "
         f"save_eval_preview={SAVE_EVAL_PREVIEW} save_best_preview={SAVE_BEST_PREVIEW} "
@@ -841,8 +923,11 @@ if __name__ == "__main__":
         model.tensorboard_log = TB_LOG_DIR
         print(f"[Init] Loaded model: {INIT_MODEL}")
     else:
+        policy_cls = PPO_CFG["policy"]
+        if SHARED_XY_ONE_STAGE_ENABLE and base_mode == "logic_box_layout":
+            policy_cls = SharedXYActorCriticPolicy
         model = PPO(
-            policy=PPO_CFG["policy"],
+            policy=policy_cls,
             env=vec_env,
             **{k: v for k, v in PPO_CFG.items() if k != "policy"},
             tensorboard_log=TB_LOG_DIR,

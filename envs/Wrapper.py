@@ -7,7 +7,9 @@ from config import (
     Gate3LevelConfig,
     GlobalOmegaControlConfig,
     get_logic_box_ranges,
+    get_logic_max_radius,
     get_logic_multi_route_pairs,
+    get_logic_port_coordinates,
     InflowConfig,
     LogicBoxConfig,
     RenderSettingConfig,
@@ -236,13 +238,14 @@ def logic_box_bounds():
 
 def logic_box_ports():
     (x0, x1), (y0, y1) = logic_box_bounds()
+    p = get_logic_port_coordinates()
     ports = {}
-    for i, yy in enumerate(np.asarray(LogicBoxConfig.LEFT_PORT_Y, dtype=np.float32)):
+    for i, yy in enumerate(np.asarray(p["left_y"], dtype=np.float32)):
         ports[f"L{i}"] = ("left", np.array([x0, float(yy)], dtype=np.float32))
-    for i, yy in enumerate(np.asarray(LogicBoxConfig.RIGHT_PORT_Y, dtype=np.float32)):
+    for i, yy in enumerate(np.asarray(p["right_y"], dtype=np.float32)):
         ports[f"R{i}"] = ("right", np.array([x1, float(yy)], dtype=np.float32))
-    ports["T0"] = ("top", np.array([float(LogicBoxConfig.TOP_PORT_X), y1], dtype=np.float32))
-    ports["B0"] = ("bottom", np.array([float(LogicBoxConfig.BOTTOM_PORT_X), y0], dtype=np.float32))
+    ports["T0"] = ("top", np.array([float(p["top_x"]), y1], dtype=np.float32))
+    ports["B0"] = ("bottom", np.array([float(p["bottom_x"]), y0], dtype=np.float32))
     return ports
 
 
@@ -426,7 +429,13 @@ def trace_streamline_until_box_exit(
         x_step = float(getattr(LogicBoxConfig, "X_STEP", 0.003))
         max_x_steps = int(getattr(LogicBoxConfig, "MAX_X_STEPS", max_steps))
         min_forward_vx = float(getattr(LogicBoxConfig, "MIN_FORWARD_VX", 1e-4))
+        low_vx_use_fallback = bool(
+            getattr(LogicBoxConfig, "LOW_VX_USE_TIMETRACE_FALLBACK", True)
+        )
+        low_vx_patience = max(1, int(getattr(LogicBoxConfig, "LOW_VX_PATIENCE", 40)))
+        low_vx_fallback_dt = float(getattr(LogicBoxConfig, "LOW_VX_FALLBACK_DT", dt))
         x_eps = 1e-6
+        low_vx_count = 0
 
         for k in range(max_x_steps):
             remain = float(x1) - float(pos[0])
@@ -454,34 +463,53 @@ def trace_streamline_until_box_exit(
             if k == 0:
                 init_vx, init_vy = float(vx), float(vy)
 
-            if float(vx) < min_forward_vx:
-                return {
-                    "exited": False,
-                    "side": None,
-                    "coord": None,
-                    "collision": False,
-                    "init_vx": init_vx,
-                    "init_vy": init_vy,
-                    "history": history,
-                }
+            use_low_vx_fallback = float(vx) < min_forward_vx
+            if use_low_vx_fallback and low_vx_use_fallback:
+                low_vx_count += 1
+                if low_vx_count > low_vx_patience:
+                    return {
+                        "exited": False,
+                        "side": None,
+                        "coord": None,
+                        "collision": False,
+                        "init_vx": init_vx,
+                        "init_vy": init_vy,
+                        "history": history,
+                    }
+                nxt = pos + np.array(
+                    [float(vx) * low_vx_fallback_dt, float(vy) * low_vx_fallback_dt],
+                    dtype=np.float64,
+                )
+            else:
+                if use_low_vx_fallback:
+                    return {
+                        "exited": False,
+                        "side": None,
+                        "coord": None,
+                        "collision": False,
+                        "init_vx": init_vx,
+                        "init_vy": init_vy,
+                        "history": history,
+                    }
 
-            dx = min(float(x_step), max(remain, 0.0))
-            if dx <= x_eps:
-                return {
-                    "exited": True,
-                    "side": "right",
-                    "coord": float(pos[1]),
-                    "collision": False,
-                    "init_vx": init_vx,
-                    "init_vy": init_vy,
-                    "history": history,
-                }
+                low_vx_count = 0
+                dx = min(float(x_step), max(remain, 0.0))
+                if dx <= x_eps:
+                    return {
+                        "exited": True,
+                        "side": "right",
+                        "coord": float(pos[1]),
+                        "collision": False,
+                        "init_vx": init_vx,
+                        "init_vy": init_vy,
+                        "history": history,
+                    }
 
-            dt_eff = dx / float(vx)
-            nxt = np.array(
-                [float(pos[0] + dx), float(pos[1] + vy * dt_eff)],
-                dtype=np.float64,
-            )
+                dt_eff = dx / float(vx)
+                nxt = np.array(
+                    [float(pos[0] + dx), float(pos[1] + vy * dt_eff)],
+                    dtype=np.float64,
+                )
             history.append(nxt.copy().tolist())
             if not is_legal(nxt, centers=centers, radii=r):
                 return {
@@ -495,11 +523,27 @@ def trace_streamline_until_box_exit(
                 }
 
             candidates = []
-            if float(nxt[0]) >= float(x1) - 1e-10:
-                ay = (float(x1) - float(pos[0])) / max(float(nxt[0] - pos[0]), 1e-12)
-                ay = min(max(ay, 0.0), 1.0)
-                y_cross = float(pos[1] + ay * float(nxt[1] - pos[1]))
-                candidates.append((ay, "right", y_cross))
+            dx_seg = float(nxt[0] - pos[0])
+            dy_seg = float(nxt[1] - pos[1])
+            if abs(dx_seg) > 1e-12:
+                a_right = (float(x1) - float(pos[0])) / dx_seg
+                if 0.0 <= a_right <= 1.0:
+                    candidates.append(
+                        (
+                            float(a_right),
+                            "right",
+                            float(pos[1] + float(a_right) * dy_seg),
+                        )
+                    )
+                a_left = (float(x0) - float(pos[0])) / dx_seg
+                if 0.0 <= a_left <= 1.0:
+                    candidates.append(
+                        (
+                            float(a_left),
+                            "left",
+                            float(pos[1] + float(a_left) * dy_seg),
+                        )
+                    )
 
             crossed_top, x_top, a_top = _crossing_x_at_y(pos, nxt, float(y1))
             if crossed_top:
@@ -660,33 +704,114 @@ def logic_box_route_metrics(
     wrong_side = 0
     pos_err = []
     forward_pen = []
+    inlet_block_pen = []
     path_fit_err = []
     path_cover_pen = []
     exits = []
 
     x_inset = max(1e-4, float(getattr(LogicBoxConfig, "SOURCE_SEED_X_INSET", 1e-4)))
+    min_forward_vx = float(getattr(LogicBoxConfig, "MIN_FORWARD_VX", 1e-4))
+    raw_reseed = np.asarray(
+        getattr(LogicBoxConfig, "SOURCE_RESEED_X_OFFSETS", [0.0]),
+        dtype=np.float32,
+    ).reshape(-1)
+    if raw_reseed.size == 0:
+        raw_reseed = np.array([0.0], dtype=np.float32)
+    if not np.any(np.abs(raw_reseed) < 1e-9):
+        raw_reseed = np.concatenate([np.array([0.0], dtype=np.float32), raw_reseed], axis=0)
+    reseed_offsets = []
+    for vv in raw_reseed.tolist():
+        v = max(0.0, float(vv))
+        if not any(abs(v - u) < 1e-8 for u in reseed_offsets):
+            reseed_offsets.append(v)
+
     for dy in seed_offsets:
-        seed = np.array([float(x0) + x_inset, float(src_xy[1] + dy)], dtype=np.float32)
-        tr = trace_streamline_until_box_exit(
-            seed=seed,
-            x=x,
-            y=y,
-            r=r,
-            omega=float(omega),
-            inflow_u=float(inflow_u),
-            inflow_v=float(inflow_v),
-        )
+        best = None
+        for offset_x in reseed_offsets:
+            seed_try = np.array(
+                [float(x0) + max(1e-4, x_inset + float(offset_x)), float(src_xy[1] + dy)],
+                dtype=np.float32,
+            )
+            tr_try = trace_streamline_until_box_exit(
+                seed=seed_try,
+                x=x,
+                y=y,
+                r=r,
+                omega=float(omega),
+                inflow_u=float(inflow_u),
+                inflow_v=float(inflow_v),
+            )
+            hist_try = np.asarray(tr_try.get("history", []), dtype=np.float32)
+            if hist_try.ndim == 2 and hist_try.shape[0] > 0 and hist_try.shape[1] >= 2:
+                x_prog_try = float(np.max(hist_try[:, 0]) - float(seed_try[0]))
+            else:
+                x_prog_try = 0.0
+
+            score = float(x_prog_try)
+            if bool(tr_try.get("exited", False)):
+                score += 2.0
+            if bool(tr_try.get("exited", False)) and str(tr_try.get("side", "")).lower() == str(tgt_side).lower():
+                score += 2.0
+            if bool(tr_try.get("collision", False)):
+                score -= 2.0
+            if float(tr_try.get("init_vx", 0.0)) >= min_forward_vx:
+                score += 0.5
+
+            if (best is None) or (score > float(best["score"])):
+                best = {
+                    "score": float(score),
+                    "seed": seed_try.copy(),
+                    "offset_x": float(offset_x),
+                    "trace": tr_try,
+                    "x_progress": float(x_prog_try),
+                }
+            # Early stop on best-case outcome: exited from target side.
+            if bool(tr_try.get("exited", False)) and str(tr_try.get("side", "")).lower() == str(tgt_side).lower():
+                break
+
+        if best is None:
+            continue
+
+        seed = np.asarray(best["seed"], dtype=np.float32)
+        tr = dict(best["trace"])
+        used_offset_x = float(best["offset_x"])
+        x_progress = float(best["x_progress"])
         exits.append(
             {
                 "seed": [float(seed[0]), float(seed[1])],
+                "seed_inset_x": float((float(seed[0]) - float(x0))),
+                "seed_extra_inset_x": float(used_offset_x),
                 "side": tr["side"],
                 "coord": tr["coord"],
                 "exited": bool(tr["exited"]),
                 "collision": bool(tr["collision"]),
                 "init_vx": float(tr["init_vx"]),
+                "init_vy": float(tr["init_vy"]),
+                "stalled": bool((not tr["exited"]) and (not tr["collision"])),
+                "x_progress": float(x_progress),
                 "history": tr.get("history", []),
             }
         )
+        # Source-neighborhood blockage: evaluate short segment from seed into the field.
+        clear_target = max(float(getattr(LogicBoxConfig, "INLET_CLEARANCE", 0.012)), 1e-6)
+        probe_dx = max(0.006, 0.75 * max(1e-4, x_inset + used_offset_x))
+        probe_pts = np.stack(
+            [
+                np.linspace(float(seed[0]), float(seed[0] + probe_dx), num=4, dtype=np.float32),
+                np.full(4, float(seed[1]), dtype=np.float32),
+            ],
+            axis=1,
+        )
+        if len(r) > 0:
+            min_clear = 1e9
+            for pxy in probe_pts:
+                d = np.hypot(x - float(pxy[0]), y - float(pxy[1])) - r
+                min_clear = min(min_clear, float(np.min(d)))
+            inlet_pen = max(0.0, (clear_target - min_clear) / clear_target)
+        else:
+            inlet_pen = 0.0
+        inlet_block_pen.append(float(inlet_pen))
+
         fwd = max(0.0, (float(LogicBoxConfig.MIN_FORWARD_VX) - float(tr["init_vx"])))
         forward_pen.append(float(fwd))
         if target_path is not None:
@@ -731,6 +856,7 @@ def logic_box_route_metrics(
         "wrong_side_ratio": float(wrong_side / n),
         "outlet_pos_error": float(np.mean(pos_err)),
         "forward_penalty": float(np.mean(forward_pen)),
+        "inlet_block_penalty": float(np.mean(inlet_block_pen)) if len(inlet_block_pen) > 0 else 0.0,
         "path_fit_error": float(np.mean(path_fit_err)) if len(path_fit_err) > 0 else 0.0,
         "path_cover_penalty": float(np.mean(path_cover_pen)) if len(path_cover_pen) > 0 else 0.0,
         "exits": exits,
@@ -759,6 +885,7 @@ def logic_box_multi_route_metrics(
     wrong_list = []
     out_list = []
     fwd_list = []
+    inlet_list = []
     fit_list = []
     cov_list = []
 
@@ -785,6 +912,7 @@ def logic_box_multi_route_metrics(
         wrong_list.append(float(m.get("wrong_side_ratio", 0.0)))
         out_list.append(float(m.get("outlet_pos_error", 0.0)))
         fwd_list.append(float(m.get("forward_penalty", 0.0)))
+        inlet_list.append(float(m.get("inlet_block_penalty", 0.0)))
         fit_list.append(float(m.get("path_fit_error", 0.0)))
         cov_list.append(float(m.get("path_cover_penalty", 0.0)))
 
@@ -811,6 +939,7 @@ def logic_box_multi_route_metrics(
         "wrong_side_ratio": float(np.mean(wrong_list)) if len(wrong_list) > 0 else 1.0,
         "outlet_pos_error": float(np.mean(out_list)) if len(out_list) > 0 else 1.0,
         "forward_penalty": float(np.mean(fwd_list)) if len(fwd_list) > 0 else 0.0,
+        "inlet_block_penalty": float(np.mean(inlet_list)) if len(inlet_list) > 0 else 0.0,
         "path_fit_error": float(np.mean(fit_list)) if len(fit_list) > 0 else 0.0,
         "path_cover_penalty": float(np.mean(cov_list)) if len(cov_list) > 0 else 0.0,
         "route_details": route_details,
@@ -1277,7 +1406,7 @@ class FollowerEnv(gym.Env):
 
         if self.base_layout_mode == "logic_box_layout":
             (x_low, x_high), (y_low, y_high) = logic_box_bounds()
-            logic_r_high = min(float(r_high), float(getattr(LogicBoxConfig, "MAX_R", r_high)))
+            logic_r_high = min(float(r_high), float(get_logic_max_radius()))
             logic_exist_th = float(
                 getattr(LogicBoxConfig, "EXIST_THRESHOLD", StokesCylinderConfig.EXIST_THRESHOLD)
             )
@@ -1443,6 +1572,7 @@ class FollowerEnv(gym.Env):
         logic_wrong_side = 0.0
         logic_outlet_error = 0.0
         logic_forward_pen = 0.0
+        logic_inlet_block_pen = 0.0
         logic_path_fit = 0.0
         logic_path_cover = 0.0
         logic_source_port = ""
@@ -1627,6 +1757,7 @@ class FollowerEnv(gym.Env):
             logic_wrong_side = float(logic_metrics["wrong_side_ratio"])
             logic_outlet_error = float(logic_metrics["outlet_pos_error"])
             logic_forward_pen = float(logic_metrics["forward_penalty"])
+            logic_inlet_block_pen = float(logic_metrics.get("inlet_block_penalty", 0.0))
             logic_path_fit = float(logic_metrics.get("path_fit_error", 0.0))
             logic_path_cover = float(logic_metrics.get("path_cover_penalty", 0.0))
             logic_source_port = str(logic_metrics["source_port"])
@@ -1694,6 +1825,7 @@ class FollowerEnv(gym.Env):
                 total_reward -= LogicBoxConfig.W_WRONG_SIDE * logic_wrong_side
                 total_reward -= LogicBoxConfig.W_OUTLET_POS * logic_outlet_error
                 total_reward -= LogicBoxConfig.W_FORWARD * logic_forward_pen
+                total_reward -= float(getattr(LogicBoxConfig, "W_INLET_BLOCK", 0.0)) * logic_inlet_block_pen
             if use_stream_terms:
                 total_reward -= LogicBoxConfig.W_PATH_FIT * logic_path_fit
                 total_reward -= LogicBoxConfig.W_PATH_COVER * logic_path_cover
@@ -1797,6 +1929,7 @@ class FollowerEnv(gym.Env):
             "logic_wrong_side_ratio": float(logic_wrong_side),
             "logic_outlet_error": float(logic_outlet_error),
             "logic_forward_penalty": float(logic_forward_pen),
+            "logic_inlet_block_penalty": float(logic_inlet_block_pen),
             "logic_path_fit_error": float(logic_path_fit),
             "logic_path_cover_penalty": float(logic_path_cover),
             "logic_source_port": logic_source_port,

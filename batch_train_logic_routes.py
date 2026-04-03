@@ -5,9 +5,13 @@ import subprocess
 import sys
 from typing import List
 
+from config import LogicBoxConfig
+
 
 def parse_layout_mode(layout_mode: str):
     mode = str(layout_mode)
+    if mode.endswith("_inflow_u_fixed"):
+        return mode[:-15], True
     if mode.endswith("_inflow_u"):
         return mode[:-9], True
     if mode.endswith("_inflow"):
@@ -15,10 +19,17 @@ def parse_layout_mode(layout_mode: str):
     return mode, False
 
 
+def _logic_bounds_suffix() -> str:
+    mode = str(getattr(LogicBoxConfig, "BOUNDS_MODE", "local_box")).strip().lower()
+    if mode in {"global", "global_field", "full_field", "render_field", "world"}:
+        return "bnd_global"
+    return "bnd_local"
+
+
 def build_task_tag(layout_mode: str, path_type: str, source_port: str, target_port: str) -> str:
     base_mode, _ = parse_layout_mode(layout_mode)
     if base_mode == "logic_box_layout":
-        return f"{layout_mode}_{path_type}_{source_port}_to_{target_port}"
+        return f"{layout_mode}_{path_type}_{source_port}_to_{target_port}__{_logic_bounds_suffix()}"
     return f"{layout_mode}_{path_type}"
 
 
