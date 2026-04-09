@@ -25,6 +25,7 @@ from utils.reseed import reseed_everything
 from config import (
     LayoutModeConfig,
     LogicBoxConfig,
+    StokesCylinderConfig,
     TrainingSettingConfig,
     get_logic_box_ranges,
     get_logic_multi_route_pairs,
@@ -123,6 +124,11 @@ def parse_train_args():
     parser.add_argument("--path-type", default=PATH_TYPE)
     parser.add_argument("--source-port", default=str(getattr(LogicBoxConfig, "SOURCE_PORT", "L1")))
     parser.add_argument("--target-port", default=str(getattr(LogicBoxConfig, "TARGET_PORT", "R1")))
+    parser.add_argument(
+        "--target-port-set",
+        default="",
+        help="Comma-separated targets for single_multi_target mode, e.g. T0,R0,B0",
+    )
     parser.add_argument("--logic-route-mode", default=str(getattr(LogicBoxConfig, "ROUTE_MODE", "single")))
     parser.add_argument("--total-timesteps", type=int, default=TOTAL_TIMESTEPS)
     parser.add_argument("--eval-freq", type=int, default=EVAL_FREQ)
@@ -190,6 +196,57 @@ def parse_train_args():
             "Enable one-stage shared-xy policy: x/y branch is target-agnostic, "
             "r/omega/inflow branch is target-aware."
         ),
+    )
+    parser.add_argument(
+        "--num-cylinders",
+        type=int,
+        default=None,
+        help="Override StokesCylinderConfig.NUM_CYLINDERS for this run.",
+    )
+    parser.add_argument(
+        "--logic-min-active-r",
+        type=float,
+        default=None,
+        help="Override LogicBoxConfig.MIN_ACTIVE_R for this run.",
+    )
+    parser.add_argument(
+        "--logic-max-r",
+        type=float,
+        default=None,
+        help="Override LogicBoxConfig.MAX_R for this run.",
+    )
+    parser.add_argument(
+        "--logic-active-cyl-limit",
+        type=int,
+        default=None,
+        help=(
+            "Override LogicBoxConfig.ACTIVE_CYL_LIMIT for this run. "
+            "K>0 means only first K cylinders are active; others use --logic-inactive-r."
+        ),
+    )
+    parser.add_argument(
+        "--logic-inactive-r",
+        type=float,
+        default=None,
+        help="Override LogicBoxConfig.INACTIVE_LOCK_R for this run.",
+    )
+    parser.add_argument(
+        "--logic-forbid-elimination",
+        dest="logic_forbid_elimination",
+        action="store_true",
+        help="Force FORBID_ELIMINATION=True for this run.",
+    )
+    parser.add_argument(
+        "--logic-allow-elimination",
+        dest="logic_forbid_elimination",
+        action="store_false",
+        help="Force FORBID_ELIMINATION=False for this run.",
+    )
+    parser.set_defaults(logic_forbid_elimination=None)
+    parser.add_argument(
+        "--run-alias",
+        default=None,
+        help="Override TrainingSettingConfig.RUN_ALIAS for this run.",
     )
     return parser.parse_args()
 
@@ -501,10 +558,35 @@ class EvalCallbackWithEarlyStop(EvalCallback):
         self.enable_auto_stage = bool(kwargs.pop("enable_auto_stage", False))
         self.auto_stage_evals_per_phase = max(1, int(kwargs.pop("auto_stage_evals_per_phase", 3)))
         self.auto_stage_snapshot_target = str(kwargs.pop("auto_stage_snapshot_target", "")).strip().upper()
+        self.enable_hard_min_train = bool(kwargs.pop("enable_hard_min_train", False))
+        self.hard_min_force_eval_env = bool(kwargs.pop("hard_min_force_eval_env", False))
         self._inflow_unfrozen = (not self.enable_inflow_warmup)
+        self._hard_min_target_port = None
+        metric_best_dir = kwargs.get("best_model_save_path", None)
+        if metric_best_dir is not None:
+            metric_best_dir = os.path.normpath(str(metric_best_dir))
+            sb3_best_dir = os.path.join(metric_best_dir, "_sb3_eval_mean")
+            kwargs["best_model_save_path"] = sb3_best_dir
+            self.metric_best_model_save_path = metric_best_dir
+            self.sb3_best_model_save_path = sb3_best_dir
+            os.makedirs(self.metric_best_model_save_path, exist_ok=True)
+            os.makedirs(self.sb3_best_model_save_path, exist_ok=True)
+        else:
+            self.metric_best_model_save_path = None
+            self.sb3_best_model_save_path = None
         super().__init__(**kwargs)
+        if self.metric_best_model_save_path is not None:
+            print(
+                f"[BestPath] metric_best={self.metric_best_model_save_path} | "
+                f"sb3_eval_mean={self.sb3_best_model_save_path}"
+            )
+        if self.enable_hard_min_train:
+            print(
+                f"[HardMin] enabled | force_eval_env={self.hard_min_force_eval_env}"
+            )
         self.no_improve_count = 0
         self._best_mean_reward = -np.inf
+        self._best_metric_key = None
         self._auto_stage_eval_count = 0
         self._auto_stage_switch_count = 0
 
@@ -519,6 +601,33 @@ class EvalCallbackWithEarlyStop(EvalCallback):
             vec_env.set_attr("inflow_control_enabled", bool(enabled))
         except Exception:
             pass
+
+    @staticmethod
+    def _set_logic_forced_target(vec_env, target_port=None):
+        try:
+            vec_env.env_method("set_logic_forced_target_port", target_port)
+            return
+        except Exception:
+            pass
+        try:
+            vec_env.set_attr("logic_forced_target_port", target_port)
+        except Exception:
+            pass
+
+    def _apply_hard_min_target(self, target_port):
+        tgt = str(target_port).strip().upper()
+        if len(tgt) == 0:
+            return
+        self._hard_min_target_port = tgt
+        self._set_logic_forced_target(self.training_env, tgt)
+        if self.hard_min_force_eval_env:
+            self._set_logic_forced_target(self.eval_env, tgt)
+
+    def _clear_hard_min_target(self):
+        self._hard_min_target_port = None
+        self._set_logic_forced_target(self.training_env, None)
+        if self.hard_min_force_eval_env:
+            self._set_logic_forced_target(self.eval_env, None)
 
     def _maybe_update_inflow_control(self):
         if not self.enable_inflow_warmup:
@@ -625,9 +734,10 @@ class EvalCallbackWithEarlyStop(EvalCallback):
         if len(targets) == 0:
             return
 
-        eval_model_stem = os.path.join(self.best_model_save_path, "_eval_current_model")
+        out_dir = self.metric_best_model_save_path or self.best_model_save_path
+        eval_model_stem = os.path.join(out_dir, "_eval_current_model")
         eval_model_path = f"{eval_model_stem}.zip"
-        eval_vn_path = os.path.join(self.best_model_save_path, "_eval_current_vecnormalize.pkl")
+        eval_vn_path = os.path.join(out_dir, "_eval_current_vecnormalize.pkl")
 
         # Snapshot current policy/normalizer so rendering matches current eval step,
         # not only the historical best checkpoint.
@@ -638,7 +748,7 @@ class EvalCallbackWithEarlyStop(EvalCallback):
             render_evaluation_run(
                 model_path=eval_model_path,
                 vecnorm_path=eval_vn_path,
-                output_dir=self.best_model_save_path,
+                output_dir=out_dir,
                 filename_prefix=f"eval_t{self.num_timesteps}_{tgt}_",
                 layout_mode=LAYOUT_MODE,
                 forced_target_port=str(tgt).upper(),
@@ -663,6 +773,7 @@ class EvalCallbackWithEarlyStop(EvalCallback):
             return float("-inf"), float("-inf"), {}
         rewards = []
         details = {}
+        restore_tgt = self._hard_min_target_port if self.hard_min_force_eval_env else None
         try:
             for tgt in targets:
                 r, info0 = self._evaluate_forced_target_reward(tgt)
@@ -670,16 +781,31 @@ class EvalCallbackWithEarlyStop(EvalCallback):
                 details[tgt] = {
                     "reward": float(r),
                     "miss": float(info0.get("logic_miss_ratio", 0.0)),
+                    "wrong": float(info0.get("logic_wrong_side_ratio", 0.0)),
                     "out": float(info0.get("logic_outlet_error", 0.0)),
                     "fit": float(info0.get("logic_path_fit_error", 0.0)),
                 }
         finally:
             try:
-                self.eval_env.env_method("set_logic_forced_target_port", None)
+                self.eval_env.env_method("set_logic_forced_target_port", restore_tgt)
             except Exception:
                 pass
         rewards_np = np.asarray(rewards, dtype=np.float32)
         return float(np.min(rewards_np)), float(np.mean(rewards_np)), details
+
+    @staticmethod
+    def _multi_target_success_stats(mt_detail: dict):
+        miss_max = float(getattr(LogicBoxConfig, "MULTI_TARGET_SUCCESS_MISS_MAX", 0.0))
+        wrong_max = float(getattr(LogicBoxConfig, "MULTI_TARGET_SUCCESS_WRONG_MAX", 0.0))
+        out_max = float(getattr(LogicBoxConfig, "MULTI_TARGET_SUCCESS_OUTLET_MAX", 0.6))
+        succ = []
+        for tgt, d in mt_detail.items():
+            miss = float(d.get("miss", 1.0))
+            wrong = float(d.get("wrong", 1.0))
+            out = float(d.get("out", 1.0))
+            if miss <= miss_max and wrong <= wrong_max and out <= out_max:
+                succ.append(str(tgt).upper())
+        return int(len(succ)), succ
 
     def _on_step(self) -> bool:
         self._maybe_update_inflow_control()
@@ -701,6 +827,11 @@ class EvalCallbackWithEarlyStop(EvalCallback):
 
             metric_value = float(self.best_mean_reward)
             metric_name = "eval_mean"
+            metric_mode = "eval_mean"
+            metric_key = float(metric_value)
+            mt_detail = {}
+            mt_min = float("-inf")
+            mt_mean = float("-inf")
             if single_multi_target_mode:
                 try:
                     mt_min, mt_mean, mt_detail = self._evaluate_single_multi_target_metric()
@@ -710,40 +841,96 @@ class EvalCallbackWithEarlyStop(EvalCallback):
                     if metric_mode in {"mean", "avg", "average"}:
                         metric_value = float(mt_mean)
                         metric_name = "multi_target_mean"
+                        metric_key = float(metric_value)
+                    elif metric_mode in {
+                        "success_then_mean",
+                        "success+mean",
+                        "success_then_avg",
+                    }:
+                        succ_cnt, succ_tgts = self._multi_target_success_stats(mt_detail)
+                        metric_value = float(mt_mean)
+                        metric_name = "multi_target_success_then_mean"
+                        metric_key = (int(succ_cnt), float(mt_mean))
                     else:
                         metric_value = float(mt_min)
                         metric_name = "multi_target_min"
+                        metric_key = float(metric_value)
                     brief = " | ".join(
                         [
-                            f"{k}:R={v['reward']:.2f},mis={v['miss']:.2f},out={v['out']:.2f}"
+                            f"{k}:R={v['reward']:.2f},mis={v['miss']:.2f},wr={v['wrong']:.2f},out={v['out']:.2f}"
                             for k, v in mt_detail.items()
                         ]
                     )
-                    print(
-                        f"[MultiTargetEval] {metric_name}={metric_value:.2f} "
-                        f"(min={mt_min:.2f}, mean={mt_mean:.2f}) | {brief}"
-                    )
+                    if metric_name == "multi_target_success_then_mean":
+                        print(
+                            f"[MultiTargetEval] {metric_name} success={metric_key[0]}/{max(1, len(mt_detail))} "
+                            f"ok={succ_tgts} mean={metric_value:.2f} (min={mt_min:.2f}) | {brief}"
+                        )
+                    else:
+                        print(
+                            f"[MultiTargetEval] {metric_name}={metric_value:.2f} "
+                            f"(min={mt_min:.2f}, mean={mt_mean:.2f}) | {brief}"
+                        )
                 except Exception as exc:
                     print(f"[MultiTargetEval] metric fallback to eval_mean: {exc}")
+                    metric_mode = "eval_mean"
+                    metric_key = float(metric_value)
+            elif self.enable_hard_min_train and (self._hard_min_target_port is not None):
+                self._clear_hard_min_target()
+                print("[HardMin] disabled for current route_mode; forced target cleared.")
 
-            if metric_value > self._best_mean_reward:
+            if single_multi_target_mode and self.enable_hard_min_train and len(mt_detail) > 0:
+                worst_tgt, worst_info = min(
+                    mt_detail.items(),
+                    key=lambda kv: float(kv[1].get("reward", -1e30)),
+                )
+                prev = self._hard_min_target_port
+                self._apply_hard_min_target(worst_tgt)
+                changed = "(updated)" if prev != self._hard_min_target_port else "(unchanged)"
+                print(
+                    f"[HardMin] train_target={self._hard_min_target_port} {changed} | "
+                    f"worst_reward={float(worst_info.get('reward', 0.0)):.2f} "
+                    f"miss={float(worst_info.get('miss', 0.0)):.2f} "
+                    f"out={float(worst_info.get('out', 0.0)):.2f}"
+                )
+
+            is_better = False
+            if metric_mode in {"success_then_mean", "success+mean", "success_then_avg"}:
+                if self._best_metric_key is None or (not isinstance(self._best_metric_key, tuple)):
+                    is_better = True
+                else:
+                    old_s, old_m = int(self._best_metric_key[0]), float(self._best_metric_key[1])
+                    new_s, new_m = int(metric_key[0]), float(metric_key[1])
+                    is_better = (new_s > old_s) or (new_s == old_s and new_m > old_m)
+            else:
+                is_better = float(metric_value) > float(self._best_mean_reward)
+
+            if is_better:
                 self._best_mean_reward = float(metric_value)
+                self._best_metric_key = metric_key
                 self.no_improve_count = 0
 
-                vn_path = os.path.join(self.best_model_save_path, "vecnormalize_best.pkl")
+                out_dir = self.metric_best_model_save_path or self.best_model_save_path
+                vn_path = os.path.join(out_dir, "vecnormalize_best.pkl")
                 # Save best by our selected metric (important for multi-target mode).
-                self.model.save(os.path.join(self.best_model_save_path, "best_model"))
+                self.model.save(os.path.join(out_dir, "best_model"))
                 self.training_env.save(vn_path)
-                print(f"[Best] updated by {metric_name}={metric_value:.2f}")
+                if metric_mode in {"success_then_mean", "success+mean", "success_then_avg"}:
+                    print(
+                        f"[Best] updated by {metric_name} | "
+                        f"success={int(metric_key[0])}/{max(1, len(mt_detail))}, mean={float(metric_value):.2f}"
+                    )
+                else:
+                    print(f"[Best] updated by {metric_name}={metric_value:.2f}")
                 if SAVE_BEST_PREVIEW:
                     if single_multi_target_mode:
                         targets = [str(t).upper() for t in logic_target_port_set()]
                         for tgt in targets:
                             try:
                                 render_evaluation_run(
-                                    model_path=os.path.join(self.best_model_save_path, "best_model.zip"),
+                                    model_path=os.path.join(out_dir, "best_model.zip"),
                                     vecnorm_path=vn_path,
-                                    output_dir=self.best_model_save_path,
+                                    output_dir=out_dir,
                                     filename_prefix=f"best_t{self.num_timesteps}_{tgt}_",
                                     layout_mode=LAYOUT_MODE,
                                     forced_target_port=str(tgt).upper(),
@@ -753,9 +940,9 @@ class EvalCallbackWithEarlyStop(EvalCallback):
                     else:
                         try:
                             render_evaluation_run(
-                                model_path=os.path.join(self.best_model_save_path, "best_model.zip"),
+                                model_path=os.path.join(out_dir, "best_model.zip"),
                                 vecnorm_path=vn_path,
-                                output_dir=self.best_model_save_path,
+                                output_dir=out_dir,
                                 filename_prefix=f"best_t{self.num_timesteps}_",
                                 layout_mode=LAYOUT_MODE,
                             )
@@ -802,11 +989,49 @@ if __name__ == "__main__":
 
     LayoutModeConfig.LAYOUT_MODE = LAYOUT_MODE
     TrainingSettingConfig.PATH_TYPE = PATH_TYPE
+    if args.run_alias is not None:
+        TrainingSettingConfig.RUN_ALIAS = str(args.run_alias).strip()
+
+    if args.num_cylinders is not None:
+        n_cyl = max(1, int(args.num_cylinders))
+        StokesCylinderConfig.NUM_CYLINDERS = int(n_cyl)
+        print(f"[Override] NUM_CYLINDERS={StokesCylinderConfig.NUM_CYLINDERS}")
+
     base_mode, _ = parse_layout_mode(LAYOUT_MODE)
     if base_mode == "logic_box_layout":
         LogicBoxConfig.ROUTE_MODE = str(args.logic_route_mode).strip().lower()
         LogicBoxConfig.SOURCE_PORT = str(args.source_port).upper()
         LogicBoxConfig.TARGET_PORT = str(args.target_port).upper()
+        tgt_set_raw = str(args.target_port_set).strip()
+        if len(tgt_set_raw) > 0:
+            parsed_tgts = [t.strip().upper() for t in tgt_set_raw.split(",") if len(t.strip()) > 0]
+            if len(parsed_tgts) > 0:
+                LogicBoxConfig.TARGET_PORT_SET = parsed_tgts
+                print(f"[Override] TARGET_PORT_SET={LogicBoxConfig.TARGET_PORT_SET}")
+        if args.logic_min_active_r is not None:
+            LogicBoxConfig.MIN_ACTIVE_R = float(args.logic_min_active_r)
+            print(f"[Override] MIN_ACTIVE_R={LogicBoxConfig.MIN_ACTIVE_R}")
+        if args.logic_max_r is not None:
+            LogicBoxConfig.MAX_R = float(args.logic_max_r)
+            print(f"[Override] MAX_R={LogicBoxConfig.MAX_R}")
+        if args.logic_active_cyl_limit is not None:
+            LogicBoxConfig.ACTIVE_CYL_LIMIT = int(args.logic_active_cyl_limit)
+            print(f"[Override] ACTIVE_CYL_LIMIT={LogicBoxConfig.ACTIVE_CYL_LIMIT}")
+        if args.logic_inactive_r is not None:
+            LogicBoxConfig.INACTIVE_LOCK_R = float(args.logic_inactive_r)
+            print(f"[Override] INACTIVE_LOCK_R={LogicBoxConfig.INACTIVE_LOCK_R}")
+        if args.logic_forbid_elimination is not None:
+            LogicBoxConfig.FORBID_ELIMINATION = bool(args.logic_forbid_elimination)
+            print(f"[Override] FORBID_ELIMINATION={LogicBoxConfig.FORBID_ELIMINATION}")
+        # Keep fixed-layout safe when N is overridden.
+        if bool(getattr(LogicBoxConfig, "FIXED_LAYOUT_ENABLE", False)):
+            fx = np.asarray(getattr(LogicBoxConfig, "FIXED_LAYOUT_X", []), dtype=np.float32).reshape(-1)
+            fy = np.asarray(getattr(LogicBoxConfig, "FIXED_LAYOUT_Y", []), dtype=np.float32).reshape(-1)
+            if fx.size != int(StokesCylinderConfig.NUM_CYLINDERS) or fy.size != int(StokesCylinderConfig.NUM_CYLINDERS):
+                LogicBoxConfig.FIXED_LAYOUT_ENABLE = False
+                print(
+                    "[Override] FIXED_LAYOUT_ENABLE=False (fixed center length mismatch with NUM_CYLINDERS)."
+                )
         if SHARED_XY_ONE_STAGE_ENABLE:
             LogicBoxConfig.FIXED_LAYOUT_ENABLE = False
             LogicBoxConfig.KEEP_XY_ACTION_WHEN_FIXED = True
@@ -854,7 +1079,15 @@ if __name__ == "__main__":
         "[TrainConfig] "
         f"mode={LAYOUT_MODE} path={PATH_TYPE} src={getattr(LogicBoxConfig, 'SOURCE_PORT', '')} "
         f"tgt={getattr(LogicBoxConfig, 'TARGET_PORT', '')} "
+        f"tgt_set={getattr(LogicBoxConfig, 'TARGET_PORT_SET', [])} "
+        f"target_sample_mode={getattr(LogicBoxConfig, 'TARGET_SAMPLE_MODE', 'random')} "
         f"route_mode={getattr(LogicBoxConfig, 'ROUTE_MODE', 'single')} "
+        f"hard_min={bool(getattr(LogicBoxConfig, 'HARD_MIN_TRAIN_ENABLE', False))} "
+        f"N={int(getattr(StokesCylinderConfig, 'NUM_CYLINDERS', 0))} "
+        f"active_k={int(getattr(LogicBoxConfig, 'ACTIVE_CYL_LIMIT', 0))} "
+        f"inactive_r={float(getattr(LogicBoxConfig, 'INACTIVE_LOCK_R', 0.0)):.4f} "
+        f"min_active_r={float(getattr(LogicBoxConfig, 'MIN_ACTIVE_R', 0.0)):.4f} "
+        f"forbid_elim={bool(getattr(LogicBoxConfig, 'FORBID_ELIMINATION', False))} "
         f"steps={TOTAL_TIMESTEPS} eval_freq={EVAL_FREQ} log_interval={LOG_INTERVAL} "
         f"workers={WORKERS} seed={SEED} "
         f"init_model={'yes' if len(INIT_MODEL)>0 else 'no'} "
@@ -947,6 +1180,8 @@ if __name__ == "__main__":
         enable_auto_stage=(AUTO_STAGE_ENABLE and base_mode == "logic_box_layout"),
         auto_stage_evals_per_phase=AUTO_STAGE_EVALS_PER_PHASE,
         auto_stage_snapshot_target=AUTO_STAGE_SNAPSHOT_TARGET,
+        enable_hard_min_train=bool(getattr(LogicBoxConfig, "HARD_MIN_TRAIN_ENABLE", False)),
+        hard_min_force_eval_env=bool(getattr(LogicBoxConfig, "HARD_MIN_FORCE_EVAL_ENV", False)),
         verbose=1,
     )
 

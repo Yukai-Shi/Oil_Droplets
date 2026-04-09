@@ -177,6 +177,125 @@ class FluidEnv:
             ).astype(np.float32)
         return np.concatenate([xp, layout], axis=0).astype(np.float32)
 
+    @staticmethod
+    def _shrink_radii_to_avoid_overlap(
+        x: np.ndarray,
+        y: np.ndarray,
+        r: np.ndarray,
+        margin: float,
+        r_floor: float,
+        iters: int,
+    ) -> np.ndarray:
+        """
+        Hard non-overlap projection by shrinking radii only.
+        Keeps centers unchanged, which avoids radius-induced center drift.
+        """
+        rr = np.asarray(r, dtype=np.float32).copy()
+        n = int(rr.size)
+        if n <= 1:
+            return rr
+
+        floor = max(0.0, float(r_floor))
+        max_iters = max(1, int(iters))
+        for _ in range(max_iters):
+            changed = False
+            for i in range(n):
+                ri = float(rr[i])
+                if ri <= 0.0:
+                    continue
+                for j in range(i + 1, n):
+                    rj = float(rr[j])
+                    if rj <= 0.0:
+                        continue
+                    dij = float(np.hypot(float(x[i]) - float(x[j]), float(y[i]) - float(y[j])))
+                    need = (ri + rj + float(margin)) - dij
+                    if need <= 1e-8:
+                        continue
+
+                    cap_i = max(0.0, ri - floor)
+                    cap_j = max(0.0, rj - floor)
+                    cap = cap_i + cap_j
+                    if cap <= 1e-12:
+                        continue
+
+                    # Split shrink proportionally to available shrink capacity.
+                    di = min(cap_i, need * (cap_i / cap))
+                    dj = min(cap_j, need * (cap_j / cap))
+                    rr[i] = np.float32(max(floor, ri - di))
+                    rr[j] = np.float32(max(floor, rj - dj))
+                    changed = True
+            if not changed:
+                break
+        return rr.astype(np.float32)
+
+    @staticmethod
+    def _separate_centers_to_avoid_overlap(
+        x: np.ndarray,
+        y: np.ndarray,
+        r: np.ndarray,
+        x0: float,
+        x1: float,
+        y0: float,
+        y1: float,
+        margin: float,
+        box_margin: float,
+        iters: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Pairwise center separation projection in-box.
+        Used as fallback when shrink-only cannot fully remove overlaps.
+        """
+        xx = np.asarray(x, dtype=np.float32).copy()
+        yy = np.asarray(y, dtype=np.float32).copy()
+        rr = np.asarray(r, dtype=np.float32)
+        n = int(rr.size)
+        if n <= 1:
+            return xx, yy
+
+        max_iters = max(1, int(iters))
+        for _ in range(max_iters):
+            moved = False
+            for i in range(n):
+                ri = float(rr[i])
+                if ri <= 0.0:
+                    continue
+                for j in range(i + 1, n):
+                    rj = float(rr[j])
+                    if rj <= 0.0:
+                        continue
+                    dx = float(xx[j]) - float(xx[i])
+                    dy = float(yy[j]) - float(yy[i])
+                    dij = float(np.hypot(dx, dy))
+                    need = (ri + rj + float(margin)) - dij
+                    if need <= 1e-8:
+                        continue
+                    if dij <= 1e-12:
+                        # Deterministic fallback direction for coincident centers.
+                        theta = ((i * 92821 + j * 68917) % 360) * np.pi / 180.0
+                        ux = float(np.cos(theta))
+                        uy = float(np.sin(theta))
+                    else:
+                        ux = dx / dij
+                        uy = dy / dij
+                    shift = 0.5 * (need + 1e-6)
+                    xx[i] = np.float32(float(xx[i]) - ux * shift)
+                    yy[i] = np.float32(float(yy[i]) - uy * shift)
+                    xx[j] = np.float32(float(xx[j]) + ux * shift)
+                    yy[j] = np.float32(float(yy[j]) + uy * shift)
+                    moved = True
+
+            # Keep centers inside box after each pass.
+            x_min = float(x0) + rr + float(box_margin)
+            x_max = float(x1) - rr - float(box_margin)
+            y_min = float(y0) + rr + float(box_margin)
+            y_max = float(y1) - rr - float(box_margin)
+            xx = np.minimum(np.maximum(xx, x_min), x_max).astype(np.float32)
+            yy = np.minimum(np.maximum(yy, y_min), y_max).astype(np.float32)
+
+            if not moved:
+                break
+        return xx, yy
+
     def apply_layout(self, action: np.ndarray):
         r_low = StokesCylinderConfig.MIN_R
         r_high = StokesCylinderConfig.MAX_R
@@ -329,6 +448,21 @@ class FluidEnv:
                 if logic_exist_th > 0.0:
                     radii = np.where(radii < logic_exist_th, 0.0, radii).astype(np.float32)
 
+            # Optional stage-wise active-cylinder gating:
+            # keep policy/action dimension fixed, but only first K cylinders are active.
+            active_k = int(getattr(LogicBoxConfig, "ACTIVE_CYL_LIMIT", 0))
+            if active_k > 0:
+                active_k = int(np.clip(active_k, 0, int(self.max_n)))
+                if active_k < int(self.max_n):
+                    inactive_r = float(
+                        np.clip(
+                            float(getattr(LogicBoxConfig, "INACTIVE_LOCK_R", 0.0)),
+                            0.0,
+                            float(r_eff_high),
+                        )
+                    )
+                    radii[active_k:] = inactive_r
+
             if self.logic_fixed_layout:
                 self.cylinders_x[:] = self.logic_fixed_x
                 self.cylinders_y[:] = self.logic_fixed_y
@@ -339,6 +473,46 @@ class FluidEnv:
                 y_max = float(y1) - radii - margin
                 self.cylinders_x[:] = np.minimum(np.maximum(new_layout[:, 0], x_min), x_max)
                 self.cylinders_y[:] = np.minimum(np.maximum(new_layout[:, 1], y_min), y_max)
+
+            if bool(getattr(LogicBoxConfig, "HARD_NON_OVERLAP_ENABLE", False)):
+                overlap_margin = float(getattr(LogicBoxConfig, "OVERLAP_MARGIN", 0.0))
+                overlap_iters = int(getattr(LogicBoxConfig, "HARD_NON_OVERLAP_ITERS", 8))
+                floor_r = float(logic_min_active_r) if logic_forbid_elimination else 0.0
+                radii = self._shrink_radii_to_avoid_overlap(
+                    x=self.cylinders_x,
+                    y=self.cylinders_y,
+                    r=radii,
+                    margin=overlap_margin,
+                    r_floor=floor_r,
+                    iters=overlap_iters,
+                )
+                if bool(getattr(LogicBoxConfig, "HARD_NON_OVERLAP_MOVE_CENTERS", True)):
+                    xx, yy = self._separate_centers_to_avoid_overlap(
+                        x=self.cylinders_x,
+                        y=self.cylinders_y,
+                        r=radii,
+                        x0=float(x0),
+                        x1=float(x1),
+                        y0=float(y0),
+                        y1=float(y1),
+                        margin=overlap_margin,
+                        box_margin=margin,
+                        iters=overlap_iters,
+                    )
+                    self.cylinders_x[:] = xx
+                    self.cylinders_y[:] = yy
+                # Re-apply boundary radius cap after overlap projection.
+                r_bound = np.minimum.reduce(
+                    [
+                        self.cylinders_x - float(x0) - margin,
+                        float(x1) - self.cylinders_x - margin,
+                        self.cylinders_y - float(y0) - margin,
+                        float(y1) - self.cylinders_y - margin,
+                    ]
+                )
+                r_bound = np.maximum(r_bound, 0.0).astype(np.float32)
+                radii = np.minimum(radii, r_bound).astype(np.float32)
+
             self.cylinders_r[:] = radii
             return
 

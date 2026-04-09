@@ -17,12 +17,12 @@ class LayoutModeConfig:
 
 class StokesCylinderConfig:
     FIXED_OMEGA = 1.256
-    NUM_CYLINDERS = 10
+    NUM_CYLINDERS = 7
 
     X_RANGE = (-0.15, 0.15)
     Y_RANGE = (-0.15, 0.15)
 
-    MIN_R = 0.002
+    MIN_R = 0.001
     MAX_R = 0.025
     EXIST_THRESHOLD = 0.003
 
@@ -67,7 +67,7 @@ class TrajectorySettingConfig:
 class InflowConfig:
     # Uniform inflow added to cylinder-induced velocity field.
     # Default is horizontal inflow from left to right.
-    U_IN = 0.004
+    U_IN = 0.002
     V_IN = 0.0
 
     # Whether inflow components are optimized by policy in *_inflow modes.
@@ -179,10 +179,29 @@ class LogicBoxConfig:
     # - "single_multi_target": fixed SOURCE_PORT, per-episode target sampled from TARGET_PORT_SET
     ROUTE_MODE = "single_multi_target"
     TARGET_PORT_SET = ["T0", "R0", "B0"]
+    # Target sampling mode for single_multi_target training:
+    # - "random": uniform random from TARGET_PORT_SET
+    # - "cycle": round-robin over TARGET_PORT_SET (recommended for balance)
+    # - "weighted": sample by TARGET_SAMPLE_WEIGHTS
+    TARGET_SAMPLE_MODE = "cycle"
+    # Used when TARGET_SAMPLE_MODE="weighted". Keys are target port names.
+    TARGET_SAMPLE_WEIGHTS = {"T0": 1.0, "R0": 1.0, "B0": 1.0}
     # single_multi_target best-checkpoint criterion:
-    # - "min": maximize worst-target reward (recommended for one-to-many robustness)
-    # - "mean": maximize average reward over targets
-    MULTI_TARGET_BEST_METRIC = "min"
+    # - "min": maximize worst-target reward
+    # - "mean": maximize average reward
+    # - "success_then_mean": maximize number of successful targets first, then mean reward
+    MULTI_TARGET_BEST_METRIC = "mean"
+    # Success thresholds used when MULTI_TARGET_BEST_METRIC="success_then_mean".
+    MULTI_TARGET_SUCCESS_MISS_MAX = 0.0
+    MULTI_TARGET_SUCCESS_WRONG_MAX = 0.0
+    MULTI_TARGET_SUCCESS_OUTLET_MAX = 0.60
+    # Hard-min training (single_multi_target only):
+    # at each eval checkpoint, find current worst target (lowest reward),
+    # then force subsequent training episodes to that target until next eval.
+    HARD_MIN_TRAIN_ENABLE = True
+    # If True, also force eval_env to hard-min target between eval checkpoints.
+    # Usually unnecessary; keep False to avoid side effects on generic eval logs.
+    HARD_MIN_FORCE_EVAL_ENV = False
     # Used when ROUTE_MODE="multi_map".
     # Default mapping: L0->T0, L1->R1, L2->B0
     MULTI_ROUTE_PAIRS = [
@@ -243,16 +262,34 @@ class LogicBoxConfig:
     # Logic-box specific geometry controls (to avoid oversized/overlapped layouts).
     # This MAX_R value is defined for BOX_X/Y_RANGE scale. When
     # MAX_R_AUTO_SCALE_TO_BOUNDS=True, it scales with logic bounds size.
-    MAX_R = 0.014
+    MAX_R = 0.020
     MAX_R_AUTO_SCALE_TO_BOUNDS = False
     EXIST_THRESHOLD = 0.0045
     # Hard floor on active radius in logic-box mode (when FORBID_ELIMINATION=True).
-    MIN_ACTIVE_R = 0.0035
+    MIN_ACTIVE_R = 0.005
     # If True, logic-box radii are clamped to at least MIN_ACTIVE_R (no r=0 elimination).
-    FORBID_ELIMINATION = True
+    FORBID_ELIMINATION = False
     # Radius <= KILLED_EPS is counted as "eliminated" in diagnostics.
     KILLED_EPS = 1e-6
+    # Stage-wise active-cylinder gate (optional):
+    # - ACTIVE_CYL_LIMIT <= 0: disabled (all cylinders active)
+    # - ACTIVE_CYL_LIMIT = K>0: only first K cylinders are active; others are forced to INACTIVE_LOCK_R
+    # Useful for curriculum: early stages use small K, later stages increase K.
+    ACTIVE_CYL_LIMIT = 0
+    # Radius assigned to inactive cylinders when ACTIVE_CYL_LIMIT is enabled.
+    # 0.0 means fully disabled (no flow influence).
+    INACTIVE_LOCK_R = 0.0
     OVERLAP_MARGIN = 0.003
+    # If True, enforce non-overlap as a hard geometric post-process in apply_layout().
+    # This uses radius shrink (not center movement) to keep layout feasible.
+    HARD_NON_OVERLAP_ENABLE = True
+    # If True, when shrink-only is insufficient, perform minimal center-separation projection.
+    HARD_NON_OVERLAP_MOVE_CENTERS = True
+    # Iterations for hard non-overlap radius resolution.
+    HARD_NON_OVERLAP_ITERS = 12
+    # If False, overlap term is not included in reward layout penalty.
+    # Useful when hard non-overlap is enabled and we want to avoid double-counting.
+    USE_OVERLAP_PENALTY = False
 
     # Reward weights.
     # REWARD_MODE:
@@ -295,7 +332,7 @@ class TrainingSettingConfig:
     PATH_TYPE = "logic_route"
     # Optional custom suffix appended to task result folder/tag.
     # Example: RUN_ALIAS = "omega_r_only_v1"
-    RUN_ALIAS = "one2three_FORBID_ELIMINATION"
+    RUN_ALIAS = "one2three_mean_Nonvoerlap"
     # Train-time diagnostics rollout for visualization only.
     RUN_DIAGNOSTIC_ROLLOUT = False
     # Visualization output switches:

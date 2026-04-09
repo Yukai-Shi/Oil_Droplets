@@ -1260,6 +1260,7 @@ class FollowerEnv(gym.Env):
         self.logic_episode_source_port = str(getattr(LogicBoxConfig, "SOURCE_PORT", "L1")).upper()
         self.logic_episode_target_port = str(getattr(LogicBoxConfig, "TARGET_PORT", "R1")).upper()
         self.logic_target_candidates = list(logic_target_port_set())
+        self.logic_target_cycle_idx = 0
         self.logic_forced_target_port = None
 
         if self.base_layout_mode == "fixed_grid_3x3":
@@ -1515,7 +1516,29 @@ class FollowerEnv(gym.Env):
             ):
                 tgt = forced_tgt
             elif _logic_is_single_multi_target_mode() and len(self.logic_target_candidates) > 0:
-                k = int(self.np_random.integers(0, len(self.logic_target_candidates)))
+                sample_mode = str(
+                    getattr(LogicBoxConfig, "TARGET_SAMPLE_MODE", "random")
+                ).strip().lower()
+                if sample_mode in {"cycle", "cyclic", "round_robin", "balanced"}:
+                    k = int(self.logic_target_cycle_idx % len(self.logic_target_candidates))
+                    self.logic_target_cycle_idx += 1
+                elif sample_mode in {"weighted", "weight"}:
+                    raw_w = getattr(LogicBoxConfig, "TARGET_SAMPLE_WEIGHTS", {})
+                    ws = []
+                    for name in self.logic_target_candidates:
+                        w = 1.0
+                        if isinstance(raw_w, dict):
+                            w = float(raw_w.get(str(name).upper(), 1.0))
+                        ws.append(max(0.0, float(w)))
+                    probs = np.asarray(ws, dtype=np.float64)
+                    s = float(np.sum(probs))
+                    if s > 1e-12:
+                        probs = probs / s
+                        k = int(self.np_random.choice(len(self.logic_target_candidates), p=probs))
+                    else:
+                        k = int(self.np_random.integers(0, len(self.logic_target_candidates)))
+                else:
+                    k = int(self.np_random.integers(0, len(self.logic_target_candidates)))
                 tgt = str(self.logic_target_candidates[k]).upper()
             else:
                 tgt = str(getattr(LogicBoxConfig, "TARGET_PORT", "R1")).upper()
@@ -1615,10 +1638,12 @@ class FollowerEnv(gym.Env):
         if self.base_layout_mode == "logic_box_layout":
             xlim, ylim = logic_box_bounds()
             overlap_margin = float(getattr(LogicBoxConfig, "OVERLAP_MARGIN", 0.001))
+            use_overlap_penalty = bool(getattr(LogicBoxConfig, "USE_OVERLAP_PENALTY", True))
         else:
             xlim = StokesCylinderConfig.X_RANGE
             ylim = StokesCylinderConfig.Y_RANGE
             overlap_margin = 0.001
+            use_overlap_penalty = True
         overlap_pen = layout_overlap_penalty(x, y, r, margin=overlap_margin)
         bound_pen = layout_boundary_penalty(
             x,
@@ -1628,7 +1653,8 @@ class FollowerEnv(gym.Env):
             ylim=ylim,
             margin=0.001,
         )
-        layout_penalty = w_layout * (overlap_pen + bound_pen)
+        overlap_term = overlap_pen if use_overlap_penalty else 0.0
+        layout_penalty = w_layout * (overlap_term + bound_pen)
 
         active_count = int(np.sum(r > 0))
         total_count = int(r.size)
