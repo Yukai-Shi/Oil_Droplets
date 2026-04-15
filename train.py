@@ -16,6 +16,7 @@ if platform.system() == "Darwin" and torch.backends.mps.is_available():
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import EvalCallback
+from stable_baselines3.common.utils import get_schedule_fn, update_learning_rate
 
 from envs.Wrapper import TaskContext, FollowerEnv, logic_box_ports, logic_target_port_set
 from envs.FluidEnv import FluidEnv
@@ -29,6 +30,7 @@ from config import (
     TrainingSettingConfig,
     get_logic_box_ranges,
     get_logic_multi_route_pairs,
+    get_logic_multi_route_sets,
 )
 
 WORKERS = 1
@@ -71,6 +73,13 @@ def build_task_tag(layout_mode: str) -> str:
     if base_mode == "logic_box_layout":
         bounds_suffix = _logic_bounds_suffix()
         route_mode = str(getattr(LogicBoxConfig, "ROUTE_MODE", "single")).strip().lower()
+        if route_mode in {"multi_map_switch", "multi_switch", "mapping_switch"}:
+            route_sets = get_logic_multi_route_sets()
+            first_pairs = route_sets[0] if len(route_sets) > 0 else get_logic_multi_route_pairs()
+            first_tag = "_".join([f"{str(s).upper()}to{str(t).upper()}" for s, t in first_pairs])
+            return _append_run_alias(
+                f"{layout_mode}_{PATH_TYPE}_multisw{len(route_sets)}_{first_tag}__{bounds_suffix}"
+            )
         if route_mode in {"multi", "multi_map", "multi_route", "mapping"}:
             pairs = get_logic_multi_route_pairs()
             pair_tag = "_".join([f"{str(s).upper()}to{str(t).upper()}" for s, t in pairs])
@@ -248,7 +257,29 @@ def parse_train_args():
         default=None,
         help="Override TrainingSettingConfig.RUN_ALIAS for this run.",
     )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=None,
+        help="Override PPO learning rate for this run (works for both fresh and resumed training).",
+    )
     return parser.parse_args()
+
+
+def _override_model_learning_rate(model: PPO, lr: float):
+    """
+    Force-update PPO learning rate even when resuming from a loaded checkpoint.
+    """
+    lr_val = float(lr)
+    model.learning_rate = lr_val
+    model.lr_schedule = get_schedule_fn(lr_val)
+    try:
+        update_learning_rate(model.policy.optimizer, float(model.lr_schedule(1.0)))
+    except Exception:
+        # Fallback in case optimizer wrapper differs.
+        for pg in model.policy.optimizer.param_groups:
+            pg["lr"] = lr_val
+    print(f"[Override] learning_rate={lr_val:.6g}")
 
 
 def bootstrap_logic_fixed_layout_from_model(model_path: str, vecnorm_path: str, layout_mode: str):
@@ -311,8 +342,11 @@ def _build_compact_eval_title(reward_value: float, info0: dict, base_mode: str) 
         dead_cnt = info0.get("inactive_count", None)
         total_cnt = info0.get("total_count", None)
         ltgt = info0.get("logic_episode_target_port", info0.get("logic_target_port", None))
+        lset = info0.get("logic_route_set_idx", None)
         if ltgt is not None:
             title += f" | tgt:{str(ltgt).upper()}"
+        if lset is not None:
+            title += f" | m:{int(lset)}"
         # Keep title short to avoid overlap with in-axes annotations.
         if lfit is not None:
             title += f" | fit:{float(lfit):.3f}"
@@ -349,6 +383,7 @@ def render_evaluation_run(
     filename_prefix,
     layout_mode=LAYOUT_MODE,
     forced_target_port=None,
+    forced_route_set_idx=None,
 ):
     print("[Visualization] Generating evaluation image...")
 
@@ -360,6 +395,8 @@ def render_evaluation_run(
     follower_env = FollowerEnv(fluid_env=fe, ctx=ctx, logic_seed_profile="eval")
     if forced_target_port is not None and hasattr(follower_env, "set_logic_forced_target_port"):
         follower_env.set_logic_forced_target_port(str(forced_target_port).upper())
+    if forced_route_set_idx is not None and hasattr(follower_env, "set_logic_forced_route_set_idx"):
+        follower_env.set_logic_forced_route_set_idx(int(forced_route_set_idx))
     vec_env = DummyVecEnv([lambda: follower_env])
 
     if os.path.isfile(vecnorm_path):
@@ -403,6 +440,8 @@ def render_evaluation_run(
     logic_tgt = info0.get("logic_target_port", None)
     logic_route_mode = str(info0.get("logic_route_mode", getattr(LogicBoxConfig, "ROUTE_MODE", "single")))
     logic_route_pairs = info0.get("logic_route_pairs", [])
+    logic_route_set_idx = info0.get("logic_route_set_idx", None)
+    logic_route_set_total = info0.get("logic_route_set_total", None)
     logic_exits = info0.get("logic_exits", [])
     inactive_count = info0.get("inactive_count", None)
     total_count = info0.get("total_count", None)
@@ -488,6 +527,8 @@ def render_evaluation_run(
             "source_port": str(logic_src) if logic_src is not None else str(LogicBoxConfig.SOURCE_PORT),
             "target_port": str(logic_tgt) if logic_tgt is not None else str(LogicBoxConfig.TARGET_PORT),
             "route_mode": str(logic_route_mode),
+            "route_set_idx": int(logic_route_set_idx) if logic_route_set_idx is not None else 0,
+            "route_set_total": int(logic_route_set_total) if logic_route_set_total is not None else 1,
             "route_pairs": route_pairs,
             "show_box": bool(getattr(LogicBoxConfig, "SHOW_BOX", True)),
             "ports": ports,
@@ -511,6 +552,7 @@ def render_evaluation_run(
         f"logic_miss={logic_miss}, logic_col={logic_collision}, logic_wrong={logic_wrong_side}, "
         f"logic_out={logic_outlet_err}, logic_fwd={logic_forward_pen}, logic_inlet={logic_inlet_block}, "
         f"logic_fit={logic_path_fit}, logic_cov={logic_path_cover}, "
+        f"logic_set={logic_route_set_idx}/{logic_route_set_total}, "
         f"inactive={inactive_count}/{total_count}, killed_eps={killed_eps}, zero_ratio={zero_radius_ratio}, "
         f"inflow_reg={inflow_reg_pen}, "
         f"inflow=({inflow_u},{inflow_v}), omega={global_omega}"
@@ -611,6 +653,18 @@ class EvalCallbackWithEarlyStop(EvalCallback):
             pass
         try:
             vec_env.set_attr("logic_forced_target_port", target_port)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _set_logic_forced_route_set(vec_env, route_set_idx=None):
+        try:
+            vec_env.env_method("set_logic_forced_route_set_idx", route_set_idx)
+            return
+        except Exception:
+            pass
+        try:
+            vec_env.set_attr("logic_forced_route_set_idx", route_set_idx)
         except Exception:
             pass
 
@@ -754,12 +808,45 @@ class EvalCallbackWithEarlyStop(EvalCallback):
                 forced_target_port=str(tgt).upper(),
             )
 
+    def _render_multi_route_switch_eval_sets(self):
+        route_sets = get_logic_multi_route_sets()
+        if len(route_sets) == 0:
+            return
+
+        out_dir = self.metric_best_model_save_path or self.best_model_save_path
+        eval_model_stem = os.path.join(out_dir, "_eval_current_model")
+        eval_model_path = f"{eval_model_stem}.zip"
+        eval_vn_path = os.path.join(out_dir, "_eval_current_vecnormalize.pkl")
+
+        self.model.save(eval_model_stem)
+        self.training_env.save(eval_vn_path)
+
+        for route_set_idx in range(len(route_sets)):
+            render_evaluation_run(
+                model_path=eval_model_path,
+                vecnorm_path=eval_vn_path,
+                output_dir=out_dir,
+                filename_prefix=f"eval_t{self.num_timesteps}_m{route_set_idx}_",
+                layout_mode=LAYOUT_MODE,
+                forced_route_set_idx=int(route_set_idx),
+            )
+
     def _evaluate_forced_target_reward(self, target_port: str):
         tgt = str(target_port).strip().upper()
         try:
             self.eval_env.env_method("set_logic_forced_target_port", tgt)
         except Exception:
             pass
+        obs = self.eval_env.reset()
+        action, _ = self.model.predict(obs, deterministic=True)
+        _, reward, _, info = self.eval_env.step(action)
+        info0 = info[0] if isinstance(info, (list, tuple)) else info
+        r = float(reward[0]) if isinstance(reward, (list, tuple, np.ndarray)) else float(reward)
+        return r, info0
+
+    def _evaluate_forced_route_set_reward(self, route_set_idx: int):
+        idx = int(route_set_idx)
+        self._set_logic_forced_route_set(self.eval_env, idx)
         obs = self.eval_env.reset()
         action, _ = self.model.predict(obs, deterministic=True)
         _, reward, _, info = self.eval_env.step(action)
@@ -793,6 +880,29 @@ class EvalCallbackWithEarlyStop(EvalCallback):
         rewards_np = np.asarray(rewards, dtype=np.float32)
         return float(np.min(rewards_np)), float(np.mean(rewards_np)), details
 
+    def _evaluate_multi_route_switch_metric(self):
+        route_sets = get_logic_multi_route_sets()
+        if len(route_sets) == 0:
+            return float("-inf"), float("-inf"), {}
+        rewards = []
+        details = {}
+        restore_idx = None
+        try:
+            for route_set_idx in range(len(route_sets)):
+                r, info0 = self._evaluate_forced_route_set_reward(route_set_idx)
+                rewards.append(float(r))
+                details[int(route_set_idx)] = {
+                    "reward": float(r),
+                    "miss": float(info0.get("logic_miss_ratio", 0.0)),
+                    "wrong": float(info0.get("logic_wrong_side_ratio", 0.0)),
+                    "out": float(info0.get("logic_outlet_error", 0.0)),
+                    "fit": float(info0.get("logic_path_fit_error", 0.0)),
+                }
+        finally:
+            self._set_logic_forced_route_set(self.eval_env, restore_idx)
+        rewards_np = np.asarray(rewards, dtype=np.float32)
+        return float(np.min(rewards_np)), float(np.mean(rewards_np)), details
+
     @staticmethod
     def _multi_target_success_stats(mt_detail: dict):
         miss_max = float(getattr(LogicBoxConfig, "MULTI_TARGET_SUCCESS_MISS_MAX", 0.0))
@@ -819,11 +929,21 @@ class EvalCallbackWithEarlyStop(EvalCallback):
                 "one_to_many",
                 "one_to_three",
             }
+            multi_route_switch_mode = route_mode in {
+                "multi_map_switch",
+                "multi_switch",
+                "mapping_switch",
+            }
             if single_multi_target_mode and SAVE_EVAL_PREVIEW:
                 try:
                     self._render_single_multi_target_eval_triplet()
                 except Exception as exc:
                     print(f"[Visualization] eval triplet render skipped: {exc}")
+            if multi_route_switch_mode and SAVE_EVAL_PREVIEW:
+                try:
+                    self._render_multi_route_switch_eval_sets()
+                except Exception as exc:
+                    print(f"[Visualization] eval route-set render skipped: {exc}")
 
             metric_value = float(self.best_mean_reward)
             metric_name = "eval_mean"
@@ -873,6 +993,34 @@ class EvalCallbackWithEarlyStop(EvalCallback):
                         )
                 except Exception as exc:
                     print(f"[MultiTargetEval] metric fallback to eval_mean: {exc}")
+                    metric_mode = "eval_mean"
+                    metric_key = float(metric_value)
+            elif multi_route_switch_mode:
+                try:
+                    mt_min, mt_mean, mt_detail = self._evaluate_multi_route_switch_metric()
+                    metric_mode = str(
+                        getattr(LogicBoxConfig, "MULTI_TARGET_BEST_METRIC", "mean")
+                    ).strip().lower()
+                    if metric_mode in {"mean", "avg", "average"}:
+                        metric_value = float(mt_mean)
+                        metric_name = "multi_route_set_mean"
+                        metric_key = float(metric_value)
+                    else:
+                        metric_value = float(mt_min)
+                        metric_name = "multi_route_set_min"
+                        metric_key = float(metric_value)
+                    brief = " | ".join(
+                        [
+                            f"m{k}:R={v['reward']:.2f},mis={v['miss']:.2f},wr={v['wrong']:.2f},out={v['out']:.2f}"
+                            for k, v in mt_detail.items()
+                        ]
+                    )
+                    print(
+                        f"[MultiRouteSetEval] {metric_name}={metric_value:.2f} "
+                        f"(min={mt_min:.2f}, mean={mt_mean:.2f}) | {brief}"
+                    )
+                except Exception as exc:
+                    print(f"[MultiRouteSetEval] metric fallback to eval_mean: {exc}")
                     metric_mode = "eval_mean"
                     metric_key = float(metric_value)
             elif self.enable_hard_min_train and (self._hard_min_target_port is not None):
@@ -937,6 +1085,22 @@ class EvalCallbackWithEarlyStop(EvalCallback):
                                 )
                             except Exception as exc:
                                 print(f"[Visualization] best render skipped for {tgt}: {exc}")
+                    elif multi_route_switch_mode:
+                        route_sets = get_logic_multi_route_sets()
+                        for route_set_idx in range(len(route_sets)):
+                            try:
+                                render_evaluation_run(
+                                    model_path=os.path.join(out_dir, "best_model.zip"),
+                                    vecnorm_path=vn_path,
+                                    output_dir=out_dir,
+                                    filename_prefix=f"best_t{self.num_timesteps}_m{route_set_idx}_",
+                                    layout_mode=LAYOUT_MODE,
+                                    forced_route_set_idx=int(route_set_idx),
+                                )
+                            except Exception as exc:
+                                print(
+                                    f"[Visualization] best render skipped for route-set {route_set_idx}: {exc}"
+                                )
                     else:
                         try:
                             render_evaluation_run(
@@ -980,6 +1144,9 @@ if __name__ == "__main__":
     WORKERS = int(args.workers)
     INIT_MODEL = str(args.init_model).strip()
     INIT_VECNORM = str(args.init_vecnorm).strip()
+    LEARNING_RATE_OVERRIDE = (
+        float(args.learning_rate) if args.learning_rate is not None else None
+    )
     RESET_NUM_TIMESTEPS = bool(args.reset_num_timesteps)
     BOOTSTRAP_FIXED_LAYOUT = bool(args.bootstrap_fixed_layout_from_init)
     AUTO_STAGE_ENABLE = bool(args.auto_stage_enable)
@@ -1080,6 +1247,7 @@ if __name__ == "__main__":
         f"mode={LAYOUT_MODE} path={PATH_TYPE} src={getattr(LogicBoxConfig, 'SOURCE_PORT', '')} "
         f"tgt={getattr(LogicBoxConfig, 'TARGET_PORT', '')} "
         f"tgt_set={getattr(LogicBoxConfig, 'TARGET_PORT_SET', [])} "
+        f"route_sets={len(get_logic_multi_route_sets()) if str(getattr(LogicBoxConfig, 'ROUTE_MODE', 'single')).strip().lower() in {'multi_map_switch','multi_switch','mapping_switch'} else 0} "
         f"target_sample_mode={getattr(LogicBoxConfig, 'TARGET_SAMPLE_MODE', 'random')} "
         f"route_mode={getattr(LogicBoxConfig, 'ROUTE_MODE', 'single')} "
         f"hard_min={bool(getattr(LogicBoxConfig, 'HARD_MIN_TRAIN_ENABLE', False))} "
@@ -1093,6 +1261,7 @@ if __name__ == "__main__":
         f"init_model={'yes' if len(INIT_MODEL)>0 else 'no'} "
         f"init_vecnorm={'yes' if len(INIT_VECNORM)>0 else 'no'} "
         f"reset_ts={RESET_NUM_TIMESTEPS} "
+        f"lr_override={LEARNING_RATE_OVERRIDE if LEARNING_RATE_OVERRIDE is not None else 'none'} "
         f"shared_xy_one_stage={SHARED_XY_ONE_STAGE_ENABLE} "
         f"auto_stage={AUTO_STAGE_ENABLE} auto_stage_evals={AUTO_STAGE_EVALS_PER_PHASE} "
         f"auto_stage_tgt={AUTO_STAGE_SNAPSHOT_TARGET or 'env'} "
@@ -1155,14 +1324,20 @@ if __name__ == "__main__":
         model = PPO.load(INIT_MODEL, env=vec_env, device=DEVICE)
         model.tensorboard_log = TB_LOG_DIR
         print(f"[Init] Loaded model: {INIT_MODEL}")
+        if LEARNING_RATE_OVERRIDE is not None:
+            _override_model_learning_rate(model, LEARNING_RATE_OVERRIDE)
     else:
         policy_cls = PPO_CFG["policy"]
         if SHARED_XY_ONE_STAGE_ENABLE and base_mode == "logic_box_layout":
             policy_cls = SharedXYActorCriticPolicy
+        ppo_kwargs = {k: v for k, v in PPO_CFG.items() if k != "policy"}
+        if LEARNING_RATE_OVERRIDE is not None:
+            ppo_kwargs["learning_rate"] = float(LEARNING_RATE_OVERRIDE)
+            print(f"[Override] PPO_CFG.learning_rate={float(LEARNING_RATE_OVERRIDE):.6g}")
         model = PPO(
             policy=policy_cls,
             env=vec_env,
-            **{k: v for k, v in PPO_CFG.items() if k != "policy"},
+            **ppo_kwargs,
             tensorboard_log=TB_LOG_DIR,
             device=DEVICE
         )

@@ -9,6 +9,7 @@ from config import (
     get_logic_box_ranges,
     get_logic_max_radius,
     get_logic_multi_route_pairs,
+    get_logic_multi_route_sets,
     get_logic_port_coordinates,
     InflowConfig,
     LogicBoxConfig,
@@ -254,7 +255,23 @@ def _logic_route_mode() -> str:
 
 
 def _logic_is_multi_route_mode() -> bool:
-    return _logic_route_mode() in {"multi", "multi_map", "multi_route", "mapping"}
+    return _logic_route_mode() in {
+        "multi",
+        "multi_map",
+        "multi_route",
+        "mapping",
+        "multi_map_switch",
+        "multi_switch",
+        "mapping_switch",
+    }
+
+
+def _logic_is_multi_route_switch_mode() -> bool:
+    return _logic_route_mode() in {
+        "multi_map_switch",
+        "multi_switch",
+        "mapping_switch",
+    }
 
 
 def _logic_is_single_multi_target_mode() -> bool:
@@ -320,6 +337,22 @@ def logic_box_active_route_pairs():
     if len(pairs) == 0:
         pairs = [("L0", "T0"), ("L1", "R1"), ("L2", "B0")]
     return pairs
+
+
+def logic_box_active_route_sets():
+    ports = logic_box_ports()
+    route_sets = []
+    for block in get_logic_multi_route_sets():
+        pairs = []
+        for src, tgt in block:
+            s, t = _logic_sanitize_pair(src, tgt)
+            if s in ports and t in ports:
+                pairs.append((s, t))
+        if len(pairs) > 0:
+            route_sets.append(pairs)
+    if len(route_sets) == 0:
+        route_sets = [logic_box_active_route_pairs()]
+    return route_sets
 
 
 def build_logic_route_path(source_port: str, target_port: str, steps: int) -> np.ndarray:
@@ -1062,7 +1095,13 @@ class TaskContext:
         self.current_step = 0
         self.particle_pos = np.array([0.0, 0.0], dtype=np.float32)
 
-    def generate_fixed_path(self, path_type="bezier", source_port=None, target_port=None):
+    def generate_fixed_path(
+        self,
+        path_type="bezier",
+        source_port=None,
+        target_port=None,
+        route_pairs=None,
+    ):
         steps = TrainingSettingConfig.EPISODE_LENGTH + 1
         s = np.linspace(0.0, 1.0, steps)
         t = np.linspace(0.0, 2.0 * np.pi, steps)
@@ -1204,7 +1243,16 @@ class TaskContext:
             ys = path[:, 1]
         elif path_type in {"logic_route", "logic_multi_route"}:
             if _logic_is_multi_route_mode():
-                pairs = logic_box_active_route_pairs()
+                if isinstance(route_pairs, (list, tuple)) and len(route_pairs) > 0:
+                    pairs = [
+                        _logic_sanitize_pair(str(p[0]), str(p[1]))
+                        for p in route_pairs
+                        if isinstance(p, (list, tuple)) and len(p) == 2
+                    ]
+                    if len(pairs) == 0:
+                        pairs = logic_box_active_route_pairs()
+                else:
+                    pairs = logic_box_active_route_pairs()
                 # Preview path for visualization: prefer center lane source (L1) if present.
                 preview_pair = pairs[0]
                 for src_name, tgt_name in pairs:
@@ -1262,6 +1310,15 @@ class FollowerEnv(gym.Env):
         self.logic_target_candidates = list(logic_target_port_set())
         self.logic_target_cycle_idx = 0
         self.logic_forced_target_port = None
+        self.logic_route_set_candidates = logic_box_active_route_sets()
+        self.logic_route_set_cycle_idx = 0
+        self.logic_forced_route_set_idx = None
+        self.logic_episode_route_set_idx = 0
+        self.logic_episode_route_pairs = (
+            list(self.logic_route_set_candidates[0])
+            if len(self.logic_route_set_candidates) > 0
+            else logic_box_active_route_pairs()
+        )
 
         if self.base_layout_mode == "fixed_grid_3x3":
             action_dim = self.env.max_n
@@ -1315,6 +1372,15 @@ class FollowerEnv(gym.Env):
             return
         self.logic_forced_target_port = str(target_port).strip().upper()
 
+    def set_logic_forced_route_set_idx(self, route_set_idx=None):
+        if route_set_idx is None:
+            self.logic_forced_route_set_idx = None
+            return
+        try:
+            self.logic_forced_route_set_idx = int(route_set_idx)
+        except Exception:
+            self.logic_forced_route_set_idx = None
+
     def set_logic_fixed_layout(self, enabled: bool, fixed_x=None, fixed_y=None):
         if hasattr(self.env, "set_logic_fixed_layout"):
             self.env.set_logic_fixed_layout(bool(enabled), fixed_x=fixed_x, fixed_y=fixed_y)
@@ -1324,6 +1390,14 @@ class FollowerEnv(gym.Env):
 
     def _logic_seed_offsets(self) -> np.ndarray:
         return logic_seed_offsets(self.logic_seed_profile)
+
+    def _logic_route_set_mode_code(self) -> np.ndarray:
+        n_sets = max(1, int(len(self.logic_route_set_candidates)))
+        k = int(np.clip(int(self.logic_episode_route_set_idx), 0, n_sets - 1))
+        if n_sets <= 1:
+            return np.array([1.0, 0.0], dtype=np.float32)
+        theta = 2.0 * np.pi * (float(k) / float(n_sets))
+        return np.array([np.cos(theta), np.sin(theta)], dtype=np.float32)
 
     def _decode_action(self, action: np.ndarray) -> np.ndarray:
         r_low, r_high = StokesCylinderConfig.MIN_R, StokesCylinderConfig.MAX_R
@@ -1481,17 +1555,22 @@ class FollowerEnv(gym.Env):
             dtype=np.float32,
         )
         if self.base_layout_mode == "logic_box_layout":
-            ports = logic_box_ports()
-            tgt = str(self.logic_episode_target_port).upper()
-            if tgt in ports:
-                target_xy = ports[tgt][1]
-                dxdy = np.array(
-                    [
-                        float(target_xy[0]) - float(self.env.particle.pos_x),
-                        float(target_xy[1]) - float(self.env.particle.pos_y),
-                    ],
-                    dtype=np.float32,
-                )
+            if _logic_is_multi_route_switch_mode():
+                # Reconfigurable mapping id code (unit-circle embedding) so policy
+                # can condition on requested route-map while keeping obs dim fixed.
+                dxdy = self._logic_route_set_mode_code()
+            else:
+                ports = logic_box_ports()
+                tgt = str(self.logic_episode_target_port).upper()
+                if tgt in ports:
+                    target_xy = ports[tgt][1]
+                    dxdy = np.array(
+                        [
+                            float(target_xy[0]) - float(self.env.particle.pos_x),
+                            float(target_xy[1]) - float(self.env.particle.pos_y),
+                        ],
+                        dtype=np.float32,
+                    )
         return np.concatenate([raw_state, dxdy]).astype(np.float32)
 
     def reset(self, *, seed=None, options=None):
@@ -1508,52 +1587,106 @@ class FollowerEnv(gym.Env):
             if src not in ports or ports[src][0] != "left":
                 src = "L1"
             self.logic_target_candidates = list(logic_target_port_set())
-            forced_tgt = str(self.logic_forced_target_port).upper() if self.logic_forced_target_port else None
-            if (
-                _logic_is_single_multi_target_mode()
-                and forced_tgt is not None
-                and forced_tgt in self.logic_target_candidates
-            ):
-                tgt = forced_tgt
-            elif _logic_is_single_multi_target_mode() and len(self.logic_target_candidates) > 0:
-                sample_mode = str(
-                    getattr(LogicBoxConfig, "TARGET_SAMPLE_MODE", "random")
-                ).strip().lower()
-                if sample_mode in {"cycle", "cyclic", "round_robin", "balanced"}:
-                    k = int(self.logic_target_cycle_idx % len(self.logic_target_candidates))
-                    self.logic_target_cycle_idx += 1
-                elif sample_mode in {"weighted", "weight"}:
-                    raw_w = getattr(LogicBoxConfig, "TARGET_SAMPLE_WEIGHTS", {})
-                    ws = []
-                    for name in self.logic_target_candidates:
-                        w = 1.0
-                        if isinstance(raw_w, dict):
-                            w = float(raw_w.get(str(name).upper(), 1.0))
-                        ws.append(max(0.0, float(w)))
-                    probs = np.asarray(ws, dtype=np.float64)
-                    s = float(np.sum(probs))
-                    if s > 1e-12:
-                        probs = probs / s
-                        k = int(self.np_random.choice(len(self.logic_target_candidates), p=probs))
+
+            if _logic_is_multi_route_switch_mode():
+                self.logic_route_set_candidates = logic_box_active_route_sets()
+                n_sets = max(1, int(len(self.logic_route_set_candidates)))
+                forced_idx = self.logic_forced_route_set_idx
+                if forced_idx is not None:
+                    set_idx = int(np.clip(int(forced_idx), 0, n_sets - 1))
+                else:
+                    sample_mode = str(
+                        getattr(LogicBoxConfig, "MULTI_ROUTE_SET_SAMPLE_MODE", "cycle")
+                    ).strip().lower()
+                    if sample_mode in {"cycle", "cyclic", "round_robin", "balanced"}:
+                        set_idx = int(self.logic_route_set_cycle_idx % n_sets)
+                        self.logic_route_set_cycle_idx += 1
+                    elif sample_mode in {"weighted", "weight"}:
+                        raw_w = getattr(LogicBoxConfig, "MULTI_ROUTE_SET_WEIGHTS", [])
+                        ws = []
+                        for i in range(n_sets):
+                            w = 1.0
+                            if isinstance(raw_w, (list, tuple)) and i < len(raw_w):
+                                w = float(raw_w[i])
+                            ws.append(max(0.0, float(w)))
+                        probs = np.asarray(ws, dtype=np.float64)
+                        s = float(np.sum(probs))
+                        if s > 1e-12:
+                            probs = probs / s
+                            set_idx = int(self.np_random.choice(n_sets, p=probs))
+                        else:
+                            set_idx = int(self.np_random.integers(0, n_sets))
+                    else:
+                        set_idx = int(self.np_random.integers(0, n_sets))
+                self.logic_episode_route_set_idx = int(set_idx)
+                self.logic_episode_route_pairs = list(
+                    self.logic_route_set_candidates[self.logic_episode_route_set_idx]
+                )
+                preview_pair = self.logic_episode_route_pairs[0]
+                for pair_src, pair_tgt in self.logic_episode_route_pairs:
+                    if str(pair_src).upper() == "L1":
+                        preview_pair = (pair_src, pair_tgt)
+                        break
+                self.logic_episode_source_port = str(preview_pair[0]).upper()
+                self.logic_episode_target_port = str(preview_pair[1]).upper()
+                self.ctx.generate_fixed_path(
+                    path_type="logic_multi_route",
+                    route_pairs=self.logic_episode_route_pairs,
+                )
+            else:
+                forced_tgt = str(self.logic_forced_target_port).upper() if self.logic_forced_target_port else None
+                if (
+                    _logic_is_single_multi_target_mode()
+                    and forced_tgt is not None
+                    and forced_tgt in self.logic_target_candidates
+                ):
+                    tgt = forced_tgt
+                elif _logic_is_single_multi_target_mode() and len(self.logic_target_candidates) > 0:
+                    sample_mode = str(
+                        getattr(LogicBoxConfig, "TARGET_SAMPLE_MODE", "random")
+                    ).strip().lower()
+                    if sample_mode in {"cycle", "cyclic", "round_robin", "balanced"}:
+                        k = int(self.logic_target_cycle_idx % len(self.logic_target_candidates))
+                        self.logic_target_cycle_idx += 1
+                    elif sample_mode in {"weighted", "weight"}:
+                        raw_w = getattr(LogicBoxConfig, "TARGET_SAMPLE_WEIGHTS", {})
+                        ws = []
+                        for name in self.logic_target_candidates:
+                            w = 1.0
+                            if isinstance(raw_w, dict):
+                                w = float(raw_w.get(str(name).upper(), 1.0))
+                            ws.append(max(0.0, float(w)))
+                        probs = np.asarray(ws, dtype=np.float64)
+                        s = float(np.sum(probs))
+                        if s > 1e-12:
+                            probs = probs / s
+                            k = int(self.np_random.choice(len(self.logic_target_candidates), p=probs))
+                        else:
+                            k = int(self.np_random.integers(0, len(self.logic_target_candidates)))
                     else:
                         k = int(self.np_random.integers(0, len(self.logic_target_candidates)))
+                    tgt = str(self.logic_target_candidates[k]).upper()
                 else:
-                    k = int(self.np_random.integers(0, len(self.logic_target_candidates)))
-                tgt = str(self.logic_target_candidates[k]).upper()
-            else:
-                tgt = str(getattr(LogicBoxConfig, "TARGET_PORT", "R1")).upper()
-                if tgt not in ports:
-                    tgt = "R1"
-            self.logic_episode_source_port = src
-            self.logic_episode_target_port = tgt
-            if _logic_is_multi_route_mode():
-                self.ctx.generate_fixed_path(path_type="logic_multi_route")
-            else:
-                self.ctx.generate_fixed_path(
-                    path_type="logic_route",
-                    source_port=src,
-                    target_port=tgt,
-                )
+                    tgt = str(getattr(LogicBoxConfig, "TARGET_PORT", "R1")).upper()
+                    if tgt not in ports:
+                        tgt = "R1"
+                self.logic_episode_source_port = src
+                self.logic_episode_target_port = tgt
+                if _logic_is_multi_route_mode():
+                    self.logic_episode_route_pairs = logic_box_active_route_pairs()
+                    self.logic_episode_route_set_idx = 0
+                    self.ctx.generate_fixed_path(
+                        path_type="logic_multi_route",
+                        route_pairs=self.logic_episode_route_pairs,
+                    )
+                else:
+                    self.logic_episode_route_pairs = []
+                    self.logic_episode_route_set_idx = 0
+                    self.ctx.generate_fixed_path(
+                        path_type="logic_route",
+                        source_port=src,
+                        target_port=tgt,
+                    )
             # One-shot logic tasks should expose endpoint direction in observation.
             self.ctx.current_step = max(0, len(self.ctx.path) - 1)
         else:
@@ -1723,8 +1856,11 @@ class FollowerEnv(gym.Env):
                 )
         elif self.base_layout_mode == "logic_box_layout":
             multi_route = _logic_is_multi_route_mode()
+            multi_route_switch = _logic_is_multi_route_switch_mode()
             single_multi_target = _logic_is_single_multi_target_mode()
-            if multi_route:
+            if multi_route_switch:
+                logic_route_mode = "multi_map_switch"
+            elif multi_route:
                 logic_route_mode = "multi_map"
             elif single_multi_target:
                 logic_route_mode = "single_multi_target"
@@ -1732,7 +1868,10 @@ class FollowerEnv(gym.Env):
                 logic_route_mode = "single"
             seed_offsets = self._logic_seed_offsets()
             if multi_route:
-                route_pairs = logic_box_active_route_pairs()
+                if multi_route_switch and len(self.logic_episode_route_pairs) > 0:
+                    route_pairs = list(self.logic_episode_route_pairs)
+                else:
+                    route_pairs = logic_box_active_route_pairs()
                 target_paths = {}
                 for src_port, tgt_port in route_pairs:
                     k = f"{str(src_port).upper()}->{str(tgt_port).upper()}"
@@ -1969,6 +2108,13 @@ class FollowerEnv(gym.Env):
             "logic_episode_source_port": str(self.logic_episode_source_port),
             "logic_episode_target_port": str(self.logic_episode_target_port),
             "logic_target_candidates": list(self.logic_target_candidates),
+            "logic_route_set_idx": int(self.logic_episode_route_set_idx),
+            "logic_route_set_total": int(len(self.logic_route_set_candidates)),
+            "logic_route_set_pairs": [
+                [str(s).upper(), str(t).upper()]
+                for s, t in self.logic_episode_route_pairs
+            ],
+            "logic_route_mode_code": self._logic_route_set_mode_code().tolist(),
             "logic_reward_mode": str(getattr(LogicBoxConfig, "REWARD_MODE", "hybrid")),
         }
 
@@ -2010,7 +2156,9 @@ class FollowerEnv(gym.Env):
             (bx0, bx1), (by0, by1) = logic_box_bounds()
             seed_offsets = self._logic_seed_offsets()
             route_pairs = []
-            if _logic_is_multi_route_mode():
+            if _logic_is_multi_route_switch_mode():
+                route_pairs = [list(p) for p in self.logic_episode_route_pairs]
+            elif _logic_is_multi_route_mode():
                 route_pairs = [list(p) for p in logic_box_active_route_pairs()]
             elif _logic_is_single_multi_target_mode():
                 src = str(self.logic_episode_source_port).upper()
@@ -2045,6 +2193,9 @@ class FollowerEnv(gym.Env):
                 "source_port": str(self.logic_episode_source_port).upper(),
                 "target_port": str(self.logic_episode_target_port).upper(),
                 "route_mode": _logic_route_mode(),
+                "route_set_idx": int(self.logic_episode_route_set_idx),
+                "route_set_total": int(len(self.logic_route_set_candidates)),
+                "route_mode_code": self._logic_route_set_mode_code().tolist(),
                 "route_pairs": route_pairs,
                 "show_box": bool(getattr(LogicBoxConfig, "SHOW_BOX", True)),
                 "ports": {

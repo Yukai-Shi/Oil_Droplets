@@ -17,7 +17,7 @@ class LayoutModeConfig:
 
 class StokesCylinderConfig:
     FIXED_OMEGA = 1.256
-    NUM_CYLINDERS = 7
+    NUM_CYLINDERS = 9
 
     X_RANGE = (-0.15, 0.15)
     Y_RANGE = (-0.15, 0.15)
@@ -176,9 +176,11 @@ class LogicBoxConfig:
     # Route objective mode:
     # - "single": optimize one route SOURCE_PORT -> TARGET_PORT
     # - "multi_map": optimize multiple fixed source->target routes together
+    # - "multi_map_switch": episode-wise switch among multiple route maps.
+    #   Each map is still evaluated as 3 inlets simultaneously routing to 3 outlets.
     # - "single_multi_target": fixed SOURCE_PORT, per-episode target sampled from TARGET_PORT_SET
-    ROUTE_MODE = "single_multi_target"
-    TARGET_PORT_SET = ["T0", "R0", "B0"]
+    ROUTE_MODE = "multi_map_switch"
+    TARGET_PORT_SET = ["T0", "R0", "R2"]
     # Target sampling mode for single_multi_target training:
     # - "random": uniform random from TARGET_PORT_SET
     # - "cycle": round-robin over TARGET_PORT_SET (recommended for balance)
@@ -198,7 +200,7 @@ class LogicBoxConfig:
     # Hard-min training (single_multi_target only):
     # at each eval checkpoint, find current worst target (lowest reward),
     # then force subsequent training episodes to that target until next eval.
-    HARD_MIN_TRAIN_ENABLE = True
+    HARD_MIN_TRAIN_ENABLE = False
     # If True, also force eval_env to hard-min target between eval checkpoints.
     # Usually unnecessary; keep False to avoid side effects on generic eval logs.
     HARD_MIN_FORCE_EVAL_ENV = False
@@ -209,22 +211,37 @@ class LogicBoxConfig:
         ("L1", "R1"),
         ("L2", "B0"),
     ]
+    # Used when ROUTE_MODE="multi_map_switch".
+    # Each element is one full route-map (usually 3 pairs for L0/L1/L2).
+    # Policy should learn to output different (r, omega, inflow) for different map ids
+    # while sharing the same x/y layout.
+    MULTI_ROUTE_SETS = [
+        [("L0", "T0"), ("L1", "R1"), ("L2", "B0")],
+        [("L0", "R0"), ("L1", "R1"), ("L2", "R2")],
+    ]
+    # Sampling of route-map index in multi_map_switch:
+    # - "random": uniform random over MULTI_ROUTE_SETS
+    # - "cycle": round-robin over MULTI_ROUTE_SETS (recommended)
+    # - "weighted": sample by MULTI_ROUTE_SET_WEIGHTS
+    MULTI_ROUTE_SET_SAMPLE_MODE = "cycle"
+    # Weights aligned with MULTI_ROUTE_SETS when sample mode is weighted.
+    MULTI_ROUTE_SET_WEIGHTS = [1.0, 1.0]
 
     # Whether logic-box uses fixed cylinder centers (only radii are optimized).
     # This is useful for "fixed layout + variable radius/omega" tasks.
-    FIXED_LAYOUT_ENABLE = False
+    FIXED_LAYOUT_ENABLE = True
     # Keep logic-box policy action dimension as x/y/r even when FIXED_LAYOUT_ENABLE=True.
     # This allows seamless stage switching (layout-search -> fixed-layout fine-tune)
     # without changing policy output dimension.
     KEEP_XY_ACTION_WHEN_FIXED = True
-    # Default fixed centers (10 cylinders) inside local box.
+    # Default fixed centers (3x3 cylinders) inside local box.
     # You can replace these arrays with your own fixed arrangement.
     FIXED_LAYOUT_X = np.array(
-        [-0.048, 0.000, 0.048, -0.048, 0.000, 0.048, -0.048, 0.000, 0.048, 0.000],
+        [-0.075, 0.020, 0.115, -0.075, 0.020, 0.115, -0.075, 0.020, 0.115],
         dtype=np.float32,
     )
     FIXED_LAYOUT_Y = np.array(
-        [0.064, 0.064, 0.064, 0.000, 0.000, 0.000, -0.064, -0.064, -0.064, 0.090],
+        [0.080, 0.080, 0.080, 0.000, 0.000, 0.000, -0.080, -0.080, -0.080],
         dtype=np.float32,
     )
 
@@ -268,7 +285,7 @@ class LogicBoxConfig:
     # Hard floor on active radius in logic-box mode (when FORBID_ELIMINATION=True).
     MIN_ACTIVE_R = 0.005
     # If True, logic-box radii are clamped to at least MIN_ACTIVE_R (no r=0 elimination).
-    FORBID_ELIMINATION = False
+    FORBID_ELIMINATION = True
     # Radius <= KILLED_EPS is counted as "eliminated" in diagnostics.
     KILLED_EPS = 1e-6
     # Stage-wise active-cylinder gate (optional):
@@ -356,7 +373,7 @@ class TrainingSettingConfig:
     # - xy is optimized by a target-agnostic actor branch
     # - r/omega/inflow is optimized by a target-aware actor branch
     # Requires logic_box free-layout action shape.
-    SHARED_XY_ONE_STAGE_ENABLE = True
+    SHARED_XY_ONE_STAGE_ENABLE = False
 
 
 class RankineSettingConfig:
@@ -451,3 +468,26 @@ def get_logic_multi_route_pairs():
     if len(pairs) == 0:
         pairs = [("L0", "T0"), ("L1", "R1"), ("L2", "B0")]
     return pairs
+
+
+def get_logic_multi_route_sets():
+    raw = getattr(LogicBoxConfig, "MULTI_ROUTE_SETS", [])
+    route_sets = []
+    if isinstance(raw, (list, tuple)):
+        for block in raw:
+            if not isinstance(block, (list, tuple)):
+                continue
+            pairs = []
+            for it in block:
+                if not isinstance(it, (list, tuple)) or len(it) != 2:
+                    continue
+                src = str(it[0]).strip().upper()
+                tgt = str(it[1]).strip().upper()
+                if len(src) == 0 or len(tgt) == 0:
+                    continue
+                pairs.append((src, tgt))
+            if len(pairs) > 0:
+                route_sets.append(pairs)
+    if len(route_sets) == 0:
+        route_sets = [get_logic_multi_route_pairs()]
+    return route_sets

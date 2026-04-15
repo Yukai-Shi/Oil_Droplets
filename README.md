@@ -126,6 +126,44 @@ python batch_curriculum_one2three.py `
 - 不要在命令里传 `--logic-forbid-elimination`
 - 若使用阶段激活功能，保持 `ACTIVE_CYL_LIMIT = 0`（或不传 `--active-cyl-stages`），避免人为限制数量
 
+### 7.3 基于已有 best 模型继续优化（独立脚本）
+
+脚本：`batch_continue_refine.py`
+
+作用：
+- 不改主环境逻辑，只是按顺序调用两次 `train.py`。
+- Phase1：固定布局微调（以半径/转速为主）。
+- Phase2：继续训练并解冻到自由布局（从 Phase1 best 接续）。
+- 默认先只跑 Phase1（`--phase2-cycles` 默认是 `0`）。
+
+示例：
+
+```powershell
+python batch_continue_refine.py `
+  --layout-mode logic_box_layout_inflow_u_fixed `
+  --path-type logic_route `
+  --source-port L1 `
+  --targets T0,R0,R2 `
+  --init-model models\best\logic_box_layout_inflow_u_fixed_logic_route_L1_to_T0R0R2__bnd_local__one2three_mean_Nonvoerlap\best_model.zip `
+  --init-vecnorm models\best\logic_box_layout_inflow_u_fixed_logic_route_L1_to_T0R0R2__bnd_local__one2three_mean_Nonvoerlap\vecnormalize_best.pkl `
+  --phase1-cycles 25 `
+  --phase1-lr 1e-4 `
+  --eval-freq 20000 `
+  --workers 1 `
+  --run-prefix cont_refine `
+```
+
+说明：
+- `phase1` 会使用 `--bootstrap-fixed-layout-from-init`，先把已有模型推断出的布局冻结后微调。
+- 只做 Phase1 时，不需要传 `--phase2-cycles`（默认已跳过），也不需要 `--phase2-lr`。
+- `phase2` 会从 `phase1` 的 best 继续训练，并启用 `--shared-xy-one-stage-enable` 进行自由布局续训。
+- 如果需要补跑 Phase2，示例：`--phase2-cycles 30 --phase2-lr 5e-5`。
+- 学习率建议：`phase1-lr=1e-4`，`phase2-lr=5e-5`（更稳，降低解冻后漂移）。
+- `train.py` 也支持单独传 `--learning-rate`，用于普通训练或手动续训。
+- 输出目录：
+  - `models/best/...__<run-prefix>_p1_fixed/`
+  - `models/best/...__<run-prefix>_p2_free/`
+
 ## 8. 测试与长轨迹可视化
 
 默认会自动找 `models/best/<task_tag>/best_model.zip`。
@@ -175,3 +213,29 @@ python test.py --layout-mode logic_box_layout_inflow_u_fixed --model models\best
 ## 11. 一个实用建议
 
 做对比实验时，每次都改 `--run-alias`（或 `RUN_ALIAS`），避免结果互相覆盖。
+
+## 12. task1+task2 合并版（同一布局 + 可切换三入口映射）
+
+目标：
+- 同一套 `x/y` 布局下，三入口同时评估三条路由；
+- 通过切换 `r/omega`（以及可选来流）在不同“映射模式”之间切换。
+
+配置（`config.py`）：
+- `LogicBoxConfig.ROUTE_MODE = "multi_map_switch"`
+- `LogicBoxConfig.REWARD_MODE = "port_only"`
+- `LogicBoxConfig.MULTI_TARGET_BEST_METRIC = "mean"`
+- `LogicBoxConfig.HARD_MIN_TRAIN_ENABLE = False`
+- 在 `LogicBoxConfig.MULTI_ROUTE_SETS` 中定义多个映射模式（每个模式是一组 3 条 `(Lx, ?)` 路由）。
+
+训练示例：
+
+```powershell
+python train.py --layout-mode logic_box_layout_inflow_u_fixed --path-type logic_route --logic-route-mode multi_map_switch --total-timesteps 240000 --eval-freq 20000 --workers 1 --run-alias multi3x3_switch_mean
+```
+
+测试指定映射模式：
+
+```powershell
+python test.py --layout-mode logic_box_layout_inflow_u_fixed --logic-route-set-idx 0
+python test.py --layout-mode logic_box_layout_inflow_u_fixed --logic-route-set-idx 1
+```

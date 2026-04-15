@@ -2,6 +2,7 @@ import argparse
 import os
 import platform
 from pathlib import Path
+from typing import Optional
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
@@ -16,6 +17,7 @@ from config import (
     LogicBoxConfig,
     TrainingSettingConfig,
     get_logic_multi_route_pairs,
+    get_logic_multi_route_sets,
 )
 from envs.FluidEnv import FluidEnv
 from envs.Renderer import FluidRenderer
@@ -64,6 +66,13 @@ def build_task_tag(layout_mode: str) -> str:
     if base_mode == "logic_box_layout":
         bounds_suffix = _logic_bounds_suffix()
         route_mode = str(getattr(LogicBoxConfig, "ROUTE_MODE", "single")).strip().lower()
+        if route_mode in {"multi_map_switch", "multi_switch", "mapping_switch"}:
+            route_sets = get_logic_multi_route_sets()
+            first_pairs = route_sets[0] if len(route_sets) > 0 else get_logic_multi_route_pairs()
+            first_tag = "_".join([f"{str(s).upper()}to{str(t).upper()}" for s, t in first_pairs])
+            return _append_run_alias(
+                f"{layout_mode}_{TrainingSettingConfig.PATH_TYPE}_multisw{len(route_sets)}_{first_tag}__{bounds_suffix}"
+            )
         if route_mode in {"multi", "multi_map", "multi_route", "mapping"}:
             pairs = get_logic_multi_route_pairs()
             pair_tag = "_".join([f"{str(s).upper()}to{str(t).upper()}" for s, t in pairs])
@@ -94,7 +103,12 @@ def default_model_paths(layout_mode: str):
     )
 
 
-def load_policy_action(model_path: str, vecnorm_path: str, layout_mode: str):
+def load_policy_action(
+    model_path: str,
+    vecnorm_path: str,
+    layout_mode: str,
+    logic_route_set_idx: Optional[int] = None,
+):
     """
     Load trained policy and infer one one-shot action.
     """
@@ -105,6 +119,8 @@ def load_policy_action(model_path: str, vecnorm_path: str, layout_mode: str):
             layout_mode=layout_mode,
         )
         _env = FollowerEnv(fluid_env=_fe, ctx=_ctx, logic_seed_profile="eval")
+        if logic_route_set_idx is not None and hasattr(_env, "set_logic_forced_route_set_idx"):
+            _env.set_logic_forced_route_set_idx(int(logic_route_set_idx))
         _vec = DummyVecEnv([lambda: _env])
         if vecnorm_path and os.path.isfile(vecnorm_path):
             _vec = VecNormalize.load(vecnorm_path, _vec)
@@ -149,6 +165,7 @@ def run_long_rollout(
     show_target_point: bool,
     show_target_path: bool,
     hide_logic_seeds: bool,
+    logic_route_set_idx: Optional[int] = None,
 ):
     ctx = TaskContext()
     fe = FluidEnv(
@@ -156,6 +173,8 @@ def run_long_rollout(
         layout_mode=layout_mode,
     )
     env = FollowerEnv(fluid_env=fe, ctx=ctx, logic_seed_profile="eval")
+    if logic_route_set_idx is not None and hasattr(env, "set_logic_forced_route_set_idx"):
+        env.set_logic_forced_route_set_idx(int(logic_route_set_idx))
     renderer = FluidRenderer()
 
     # Reset and apply one-shot layout once.
@@ -251,6 +270,12 @@ def parse_args():
         help="VecNormalize pkl path. default: models/best/<task_tag>/vecnormalize_best.pkl",
     )
     parser.add_argument("--layout-mode", default=LayoutModeConfig.LAYOUT_MODE)
+    parser.add_argument(
+        "--logic-route-set-idx",
+        type=int,
+        default=None,
+        help="Force route-set index in multi_map_switch mode for deterministic test/eval.",
+    )
     parser.add_argument("--rollout-steps", type=int, default=400)
     parser.add_argument("--frame-stride", type=int, default=1)
     parser.add_argument("--fps", type=int, default=20)
@@ -306,7 +331,8 @@ def main():
 
     print(
         f"[Config] mode={args.layout_mode}, rollout_steps={args.rollout_steps}, "
-        f"frame_stride={args.frame_stride}, fps={args.fps}, model={model_path}"
+        f"frame_stride={args.frame_stride}, fps={args.fps}, model={model_path}, "
+        f"route_set_idx={args.logic_route_set_idx}"
     )
 
     base_mode, _ = parse_layout_mode(args.layout_mode)
@@ -326,6 +352,7 @@ def main():
         model_path=model_path,
         vecnorm_path=vecnorm_path,
         layout_mode=args.layout_mode,
+        logic_route_set_idx=args.logic_route_set_idx,
     )
     print(f"[Action] decoded_dim={physical_action.shape[0]}")
 
@@ -339,6 +366,7 @@ def main():
         show_target_point=args.show_target_point,
         show_target_path=(not hide_target_path),
         hide_logic_seeds=hide_logic_seeds,
+        logic_route_set_idx=args.logic_route_set_idx,
     )
 
 
