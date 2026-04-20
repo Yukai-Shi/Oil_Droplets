@@ -239,3 +239,33 @@ python train.py --layout-mode logic_box_layout_inflow_u_fixed --path-type logic_
 python test.py --layout-mode logic_box_layout_inflow_u_fixed --logic-route-set-idx 0
 python test.py --layout-mode logic_box_layout_inflow_u_fixed --logic-route-set-idx 1
 ```
+
+## 13. A/B 交替脚本（同一目录归档）
+
+脚本：`batch_ab_multiswitch.py`
+
+作用：
+- A 阶段：放开 `x/y/r/omega`（`--shared-xy-one-stage-enable`）找布局；
+- B 阶段：从 A 阶段 best 启动并 `--bootstrap-fixed-layout-from-init`，冻结 `x/y` 只训控制码；
+- 自动执行 `A0 -> B0 -> A1 -> B1`；
+- 把每阶段产物统一复制到一个目录：`models/ab_runs/<run-prefix>__<layout>__<path>/`。
+
+示例：
+
+```powershell
+python batch_ab_multiswitch.py `
+  --layout-mode logic_box_layout_inflow_u_fixed `
+  --path-type logic_route `
+  --route-mode multi_map_switch `
+  --stage-cycles 15,15,4,8 `
+  --stage-lrs 1e-4,5e-5,5e-5,3e-5 `
+  --eval-freq 20000 `
+  --workers 1 `
+  --run-prefix multi3x3_ab_mean `
+  --run-tests
+```
+
+说明：
+- `--stage-cycles` / `--stage-lrs` 顺序固定为 `[A0,B0,A1,B1]`。
+- 任一阶段填 `0` 可跳过该阶段（例如只跑 `A0,B0`）。
+- `--run-tests` 会在最终模型上按 route-set index 逐个调用 `test.py`，GIF 也归档到同一 bundle 目录。

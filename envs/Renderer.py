@@ -206,25 +206,69 @@ class FluidRenderer:
             src = str(logic_box.get("source_port", ""))
             tgt = str(logic_box.get("target_port", ""))
             route_pairs = logic_box.get("route_pairs", [])
+            # Fixed inlet-color convention for readability across route sets.
+            inlet_colors = {
+                "L0": "#2563eb",  # blue
+                "L1": "#f59e0b",  # amber
+                "L2": "#10b981",  # emerald
+            }
+            neutral_port = "#9ca3af"
             src_set = set()
             tgt_set = set()
+            active_pairs = []
+            tgt_to_src = {}
             if isinstance(route_pairs, (list, tuple)):
                 for pair in route_pairs:
                     if isinstance(pair, (list, tuple)) and len(pair) == 2:
-                        src_set.add(str(pair[0]).upper())
-                        tgt_set.add(str(pair[1]).upper())
+                        s_name = str(pair[0]).upper()
+                        t_name = str(pair[1]).upper()
+                        src_set.add(s_name)
+                        tgt_set.add(t_name)
+                        active_pairs.append((s_name, t_name))
+                        if t_name not in tgt_to_src:
+                            tgt_to_src[t_name] = s_name
+            if len(active_pairs) == 0 and len(src) > 0 and len(tgt) > 0:
+                s_name = str(src).upper()
+                t_name = str(tgt).upper()
+                active_pairs = [(s_name, t_name)]
+                src_set.add(s_name)
+                tgt_set.add(t_name)
+                tgt_to_src[t_name] = s_name
+
+            # Draw compact route hints: source->target, same color as source.
+            for s_name, t_name in active_pairs:
+                s_info = ports.get(s_name, None)
+                t_info = ports.get(t_name, None)
+                if s_info is None or t_info is None:
+                    continue
+                sxy = s_info.get("xy", [0.0, 0.0])
+                txy = t_info.get("xy", [0.0, 0.0])
+                sx, sy = float(sxy[0]), float(sxy[1])
+                tx, ty = float(txy[0]), float(txy[1])
+                color = inlet_colors.get(s_name, "#374151")
+                self.ax.plot(
+                    [sx, tx],
+                    [sy, ty],
+                    linestyle="--",
+                    lw=1.0,
+                    color=color,
+                    alpha=0.55,
+                    zorder=4.7,
+                )
+
             for name, info in ports.items():
                 xy = info.get("xy", [0.0, 0.0])
                 px, py = float(xy[0]), float(xy[1])
-                color = "#1f2937"
-                if name.upper() in src_set:
-                    color = "#16a34a"
-                if name.upper() in tgt_set:
-                    color = "#dc2626"
-                if name == src and len(src_set) == 0:
-                    color = "#16a34a"
-                elif name == tgt and len(tgt_set) == 0:
-                    color = "#dc2626"
+                nm = str(name).upper()
+                side = str(info.get("side", "")).lower()
+                color = neutral_port
+                if side == "left":
+                    if nm in src_set:
+                        color = inlet_colors.get(nm, "#374151")
+                else:
+                    if nm in tgt_set:
+                        src_name = tgt_to_src.get(nm, "")
+                        color = inlet_colors.get(src_name, "#374151")
                 self.ax.plot(px, py, marker="o", ms=4, color=color, zorder=6)
                 x0, x1 = self.ax.get_xlim()
                 y0, y1 = self.ax.get_ylim()
@@ -256,29 +300,53 @@ class FluidRenderer:
                     )
 
             seed_points = logic_box.get("seed_points", [])
+            left_port_y = []
+            for name, info in ports.items():
+                if str(info.get("side", "")).lower() == "left":
+                    pxy = info.get("xy", [0.0, 0.0])
+                    left_port_y.append((str(name).upper(), float(pxy[1])))
+
+            def _infer_source_from_seed(seed_xy):
+                if not isinstance(seed_xy, (list, tuple)) or len(seed_xy) < 2:
+                    return ""
+                if len(left_port_y) == 0:
+                    return ""
+                sy0 = float(seed_xy[1])
+                best_name = left_port_y[0][0]
+                best_d = abs(sy0 - left_port_y[0][1])
+                for nm, yy in left_port_y[1:]:
+                    d = abs(sy0 - yy)
+                    if d < best_d:
+                        best_d = d
+                        best_name = nm
+                return best_name
+
             for i, sp in enumerate(seed_points):
                 sx, sy = float(sp[0]), float(sp[1])
-                self.ax.plot(sx, sy, marker="D", ms=4, color="#0f766e", zorder=6)
+                src_name = _infer_source_from_seed(sp)
+                color = inlet_colors.get(src_name, "#6b7280")
+                self.ax.plot(sx, sy, marker="D", ms=4, color=color, zorder=6)
                 self.ax.text(
                     sx + 0.004,
                     sy + 0.004,
                     f"s{i}",
                     fontsize=7,
-                    color="#0f766e",
+                    color=color,
                     bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.75),
                     zorder=7,
                 )
 
             seed_streamlines = logic_box.get("seed_streamlines", [])
-            seed_colors = ["#0ea5e9", "#f59e0b", "#22c55e", "#a855f7", "#ef4444"]
             x0_ax, x1_ax = self.ax.get_xlim()
             y0_ax, y1_ax = self.ax.get_ylim()
             seg_len = 0.035 * max(float(x1_ax) - float(x0_ax), float(y1_ax) - float(y0_ax))
             for i, tr in enumerate(seed_streamlines):
                 hist = tr.get("history", [])
-                color = seed_colors[i % len(seed_colors)]
-                if bool(tr.get("collision", False)):
-                    color = "#dc2626"
+                tr_src = str(tr.get("source_port", "")).upper()
+                if len(tr_src) == 0:
+                    tr_src = _infer_source_from_seed(tr.get("seed", None))
+                color = inlet_colors.get(tr_src, "#6b7280")
+                tr_alpha = 0.95 if (not bool(tr.get("collision", False))) else 0.70
                 arr = None
                 if isinstance(hist, (list, tuple)) and len(hist) >= 2:
                     arr = np.asarray(hist, dtype=np.float32)
@@ -292,7 +360,7 @@ class FluidRenderer:
                         linestyle="-.",
                         lw=1.3,
                         color=color,
-                        alpha=0.95,
+                        alpha=tr_alpha,
                         zorder=5,
                     )
                     self.ax.plot(
@@ -330,11 +398,33 @@ class FluidRenderer:
                             linestyle=":",
                             lw=1.5,
                             color=color,
-                            alpha=0.95,
+                            alpha=tr_alpha,
                             zorder=5,
                         )
                         self.ax.plot(sx, sy, marker="D", ms=4, color=color, zorder=6)
                         self.ax.plot(ex, ey, marker="x", ms=5, color=color, zorder=6)
+
+            # Compact inlet-color legend for cross-figure consistency.
+            x0_ax, x1_ax = self.ax.get_xlim()
+            y0_ax, y1_ax = self.ax.get_ylim()
+            lx = float(x0_ax + 0.012 * (x1_ax - x0_ax))
+            ly0 = float(y1_ax - 0.028 * (y1_ax - y0_ax))
+            dy = float(0.024 * (y1_ax - y0_ax))
+            for i, nm in enumerate(["L0", "L1", "L2"]):
+                ly = ly0 - i * dy
+                col = inlet_colors.get(nm, "#374151")
+                self.ax.plot(lx, ly, marker="o", ms=4, color=col, zorder=7)
+                self.ax.text(
+                    lx + 0.008 * (x1_ax - x0_ax),
+                    ly,
+                    nm,
+                    fontsize=7,
+                    color=col,
+                    ha="left",
+                    va="center",
+                    bbox=dict(boxstyle="round,pad=0.10", fc="white", ec="none", alpha=0.70),
+                    zorder=7,
+                )
 
         px, py = scene["particle"]["x"], scene["particle"]["y"]
         self.ax.plot(px, py, "ro", ms=5, zorder=5)

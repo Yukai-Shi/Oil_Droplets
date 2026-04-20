@@ -216,8 +216,8 @@ class LogicBoxConfig:
     # Policy should learn to output different (r, omega, inflow) for different map ids
     # while sharing the same x/y layout.
     MULTI_ROUTE_SETS = [
-        [("L0", "T0"), ("L1", "R1"), ("L2", "B0")],
-        [("L0", "R0"), ("L1", "R1"), ("L2", "R2")],
+        [("L0", "T0"), ("L1", "R0"), ("L2", "B0")],
+        [("L0", "R0"), ("L1", "R1"), ("L2", "B0")],
     ]
     # Sampling of route-map index in multi_map_switch:
     # - "random": uniform random over MULTI_ROUTE_SETS
@@ -248,15 +248,15 @@ class LogicBoxConfig:
     # Streamline tracing settings.
     # "x_march" is recommended for left-to-right routing tasks.
     TRACE_MODE = "x_march"
-    X_STEP = 0.003
-    MAX_X_STEPS = 240
+    X_STEP = 0.004
+    MAX_X_STEPS = 180
     TRACE_DT = 0.004
     TRACE_STEPS = 300
     MIN_FORWARD_VX = 2e-5
     # In x_march mode, do not hard-fail immediately on low vx near inlet.
     # Use short time-trace fallback so streamlines can escape local recirculation.
     LOW_VX_USE_TIMETRACE_FALLBACK = True
-    LOW_VX_PATIENCE = 220
+    LOW_VX_PATIENCE = 100
     LOW_VX_FALLBACK_DT = 0.004
     # Seed/start x inset from left boundary to avoid hugging the wall.
     SOURCE_SEED_X_INSET = 0.006
@@ -285,7 +285,7 @@ class LogicBoxConfig:
     # Hard floor on active radius in logic-box mode (when FORBID_ELIMINATION=True).
     MIN_ACTIVE_R = 0.005
     # If True, logic-box radii are clamped to at least MIN_ACTIVE_R (no r=0 elimination).
-    FORBID_ELIMINATION = True
+    FORBID_ELIMINATION = False
     # Radius <= KILLED_EPS is counted as "eliminated" in diagnostics.
     KILLED_EPS = 1e-6
     # Stage-wise active-cylinder gate (optional):
