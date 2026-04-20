@@ -22,6 +22,7 @@ class StokesCylinderConfig:
     X_RANGE = (-0.15, 0.15)
     Y_RANGE = (-0.15, 0.15)
 
+
     MIN_R = 0.001
     MAX_R = 0.025
     EXIST_THRESHOLD = 0.003
