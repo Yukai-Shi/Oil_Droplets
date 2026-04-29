@@ -5,6 +5,12 @@ Manifest.toml
 LocalPreferences.toml
 /docs/build/
 
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
 # gfx
 *.png
 *.jpg
