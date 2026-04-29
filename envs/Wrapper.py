@@ -1328,7 +1328,9 @@ class FollowerEnv(gym.Env):
             keep_xy_when_fixed = bool(
                 getattr(LogicBoxConfig, "KEEP_XY_ACTION_WHEN_FIXED", False)
             )
-            if bool(getattr(self.env, "logic_fixed_layout", False)) and (not keep_xy_when_fixed):
+            if bool(getattr(self.env, "logic_fixed_geometry", False)):
+                action_dim = 0
+            elif bool(getattr(self.env, "logic_fixed_layout", False)) and (not keep_xy_when_fixed):
                 action_dim = self.env.max_n
             else:
                 action_dim = self.env.max_n * 3
@@ -1407,12 +1409,20 @@ class FollowerEnv(gym.Env):
         omega_tail = []
         tail_dim = self.env.inflow_action_dim + self.env.omega_action_dim
         if tail_dim > 0:
-            if a_full.size <= tail_dim:
+            allow_tail_only = bool(
+                self.base_layout_mode == "logic_box_layout"
+                and getattr(self.env, "logic_fixed_geometry", False)
+            )
+            if a_full.size < tail_dim or (a_full.size == tail_dim and not allow_tail_only):
                 raise ValueError(
                     f"Action dim too small for layout+tail decode: {a_full.size}"
                 )
-            a_layout = a_full[:-tail_dim]
-            a_tail = a_full[-tail_dim:]
+            if a_full.size == tail_dim:
+                a_layout = np.empty((0,), dtype=np.float32)
+                a_tail = a_full
+            else:
+                a_layout = a_full[:-tail_dim]
+                a_tail = a_full[-tail_dim:]
             k = 0
             if self.env.inflow_action_dim > 0:
                 if self.env.optimize_inflow_u:
@@ -1487,7 +1497,9 @@ class FollowerEnv(gym.Env):
             )
             logic_forbid_elimination = bool(getattr(LogicBoxConfig, "FORBID_ELIMINATION", False))
             logic_min_active_r = max(float(r_low), float(getattr(LogicBoxConfig, "MIN_ACTIVE_R", r_low)))
-            if bool(getattr(self.env, "logic_fixed_layout", False)):
+            if bool(getattr(self.env, "logic_fixed_geometry", False)):
+                layout_vec = np.empty((0,), dtype=np.float32)
+            elif bool(getattr(self.env, "logic_fixed_layout", False)):
                 # Compatibility:
                 # - legacy fixed-layout policies output N radii
                 # - stage-switch compatible policies may still output N*3 (x/y/r); use only r
@@ -1932,8 +1944,10 @@ class FollowerEnv(gym.Env):
             logic_route_pairs = list(logic_metrics.get("route_pairs", []))
             if single_multi_target:
                 logic_route_pairs = [
-                    [str(self.logic_episode_source_port).upper(), str(t).upper()]
-                    for t in self.logic_target_candidates
+                    [
+                        str(self.logic_episode_source_port).upper(),
+                        str(self.logic_episode_target_port).upper(),
+                    ]
                 ]
             logic_route_details = list(logic_metrics.get("route_details", []))
             logic_exits = list(logic_metrics["exits"])
@@ -2162,7 +2176,8 @@ class FollowerEnv(gym.Env):
                 route_pairs = [list(p) for p in logic_box_active_route_pairs()]
             elif _logic_is_single_multi_target_mode():
                 src = str(self.logic_episode_source_port).upper()
-                route_pairs = [[src, t] for t in self.logic_target_candidates]
+                tgt = str(self.logic_episode_target_port).upper()
+                route_pairs = [[src, tgt]]
             src = str(getattr(LogicBoxConfig, "SOURCE_PORT", "L1")).upper()
             if src not in ports:
                 src = "L1"

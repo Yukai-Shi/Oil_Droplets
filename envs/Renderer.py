@@ -206,6 +206,7 @@ class FluidRenderer:
             src = str(logic_box.get("source_port", ""))
             tgt = str(logic_box.get("target_port", ""))
             route_pairs = logic_box.get("route_pairs", [])
+            route_mode = str(logic_box.get("route_mode", "")).strip().lower()
             # Fixed inlet-color convention for readability across route sets.
             inlet_colors = {
                 "L0": "#2563eb",  # blue
@@ -234,27 +235,6 @@ class FluidRenderer:
                 src_set.add(s_name)
                 tgt_set.add(t_name)
                 tgt_to_src[t_name] = s_name
-
-            # Draw compact route hints: source->target, same color as source.
-            for s_name, t_name in active_pairs:
-                s_info = ports.get(s_name, None)
-                t_info = ports.get(t_name, None)
-                if s_info is None or t_info is None:
-                    continue
-                sxy = s_info.get("xy", [0.0, 0.0])
-                txy = t_info.get("xy", [0.0, 0.0])
-                sx, sy = float(sxy[0]), float(sxy[1])
-                tx, ty = float(txy[0]), float(txy[1])
-                color = inlet_colors.get(s_name, "#374151")
-                self.ax.plot(
-                    [sx, tx],
-                    [sy, ty],
-                    linestyle="--",
-                    lw=1.0,
-                    color=color,
-                    alpha=0.55,
-                    zorder=4.7,
-                )
 
             for name, info in ports.items():
                 xy = info.get("xy", [0.0, 0.0])
@@ -299,7 +279,6 @@ class FluidRenderer:
                         zorder=7,
                     )
 
-            seed_points = logic_box.get("seed_points", [])
             left_port_y = []
             for name, info in ports.items():
                 if str(info.get("side", "")).lower() == "left":
@@ -321,21 +300,6 @@ class FluidRenderer:
                         best_name = nm
                 return best_name
 
-            for i, sp in enumerate(seed_points):
-                sx, sy = float(sp[0]), float(sp[1])
-                src_name = _infer_source_from_seed(sp)
-                color = inlet_colors.get(src_name, "#6b7280")
-                self.ax.plot(sx, sy, marker="D", ms=4, color=color, zorder=6)
-                self.ax.text(
-                    sx + 0.004,
-                    sy + 0.004,
-                    f"s{i}",
-                    fontsize=7,
-                    color=color,
-                    bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.75),
-                    zorder=7,
-                )
-
             seed_streamlines = logic_box.get("seed_streamlines", [])
             x0_ax, x1_ax = self.ax.get_xlim()
             y0_ax, y1_ax = self.ax.get_ylim()
@@ -345,7 +309,7 @@ class FluidRenderer:
                 tr_src = str(tr.get("source_port", "")).upper()
                 if len(tr_src) == 0:
                     tr_src = _infer_source_from_seed(tr.get("seed", None))
-                color = inlet_colors.get(tr_src, "#6b7280")
+                color = "#ef4444"
                 tr_alpha = 0.95 if (not bool(tr.get("collision", False))) else 0.70
                 arr = None
                 if isinstance(hist, (list, tuple)) and len(hist) >= 2:
@@ -357,8 +321,8 @@ class FluidRenderer:
                     self.ax.plot(
                         arr[:, 0],
                         arr[:, 1],
-                        linestyle="-.",
-                        lw=1.3,
+                        linestyle="-",
+                        lw=1.6,
                         color=color,
                         alpha=tr_alpha,
                         zorder=5,
@@ -366,8 +330,8 @@ class FluidRenderer:
                     self.ax.plot(
                         float(arr[0, 0]),
                         float(arr[0, 1]),
-                        marker="D",
-                        ms=4,
+                        marker="o",
+                        ms=3.8,
                         color=color,
                         zorder=6,
                     )
@@ -395,36 +359,43 @@ class FluidRenderer:
                         self.ax.plot(
                             [sx, ex],
                             [sy, ey],
-                            linestyle=":",
+                            linestyle="-",
                             lw=1.5,
                             color=color,
                             alpha=tr_alpha,
                             zorder=5,
                         )
-                        self.ax.plot(sx, sy, marker="D", ms=4, color=color, zorder=6)
+                        self.ax.plot(sx, sy, marker="o", ms=3.8, color=color, zorder=6)
                         self.ax.plot(ex, ey, marker="x", ms=5, color=color, zorder=6)
 
-            # Compact inlet-color legend for cross-figure consistency.
-            x0_ax, x1_ax = self.ax.get_xlim()
-            y0_ax, y1_ax = self.ax.get_ylim()
-            lx = float(x0_ax + 0.012 * (x1_ax - x0_ax))
-            ly0 = float(y1_ax - 0.028 * (y1_ax - y0_ax))
-            dy = float(0.024 * (y1_ax - y0_ax))
-            for i, nm in enumerate(["L0", "L1", "L2"]):
-                ly = ly0 - i * dy
-                col = inlet_colors.get(nm, "#374151")
-                self.ax.plot(lx, ly, marker="o", ms=4, color=col, zorder=7)
-                self.ax.text(
-                    lx + 0.008 * (x1_ax - x0_ax),
-                    ly,
-                    nm,
-                    fontsize=7,
-                    color=col,
-                    ha="left",
-                    va="center",
-                    bbox=dict(boxstyle="round,pad=0.10", fc="white", ec="none", alpha=0.70),
-                    zorder=7,
-                )
+            show_inlet_legend = route_mode in {
+                "multi_map",
+                "multi_route",
+                "multi_map_switch",
+                "multi_switch",
+                "mapping_switch",
+            }
+            if show_inlet_legend:
+                x0_ax, x1_ax = self.ax.get_xlim()
+                y0_ax, y1_ax = self.ax.get_ylim()
+                lx = float(x0_ax + 0.012 * (x1_ax - x0_ax))
+                ly0 = float(y1_ax - 0.028 * (y1_ax - y0_ax))
+                dy = float(0.024 * (y1_ax - y0_ax))
+                for i, nm in enumerate(["L0", "L1", "L2"]):
+                    ly = ly0 - i * dy
+                    col = inlet_colors.get(nm, "#374151")
+                    self.ax.plot(lx, ly, marker="o", ms=4, color=col, zorder=7)
+                    self.ax.text(
+                        lx + 0.008 * (x1_ax - x0_ax),
+                        ly,
+                        nm,
+                        fontsize=7,
+                        color=col,
+                        ha="left",
+                        va="center",
+                        bbox=dict(boxstyle="round,pad=0.10", fc="white", ec="none", alpha=0.70),
+                        zorder=7,
+                    )
 
         px, py = scene["particle"]["x"], scene["particle"]["y"]
         self.ax.plot(px, py, "ro", ms=5, zorder=5)

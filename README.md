@@ -46,6 +46,36 @@ python train.py --layout-mode logic_box_layout_inflow_u_fixed --path-type logic_
 - 实际目标集合由 `--target-port-set` 决定。
 - 目标采样默认建议用 `LogicBoxConfig.TARGET_SAMPLE_MODE = "cycle"`，保证 `T0/R0/B0` 轮流训练，不会长期偏向某两个口。
 
+### 4.1 固定几何、只调全局转速（omega-only）
+
+目标：
+- 圆柱 `x/y/r` 在一局中完全固定；
+- 水平来流固定；
+- 策略只输出一个全局 `omega`，通过转速大小和方向让同一入口去不同出口。
+
+关键配置（`config.py`）：
+- `LayoutModeConfig.LAYOUT_MODE = "logic_box_layout_inflow_u_fixed"`
+- `LogicBoxConfig.ROUTE_MODE = "single_multi_target"`
+- `LogicBoxConfig.FIXED_LAYOUT_ENABLE = True`
+- `LogicBoxConfig.FIXED_GEOMETRY_ENABLE = True`
+- `LogicBoxConfig.FIXED_LAYOUT_X/Y/R` 定义固定圆柱位置和半径
+- `GlobalOmegaControlConfig.OPTIMIZE_OMEGA = True`
+- `GlobalOmegaControlConfig.MODE = "continuous"`
+
+训练示例：
+
+```powershell
+python train.py --layout-mode logic_box_layout_inflow_u_fixed --path-type logic_route --logic-route-mode single_multi_target --source-port L1 --target-port R0 --target-port-set R0,R1,R2 --total-timesteps 240000 --eval-freq 40000 --workers 1 --run-alias omega_only_fixed_geom
+```
+
+测试某个目标出口：
+
+```powershell
+python test.py --layout-mode logic_box_layout_inflow_u_fixed --model models\best\<your_tag>\best_model.zip --vecnorm models\best\<your_tag>\vecnormalize_best.pkl --logic-target-port R0
+python test.py --layout-mode logic_box_layout_inflow_u_fixed --model models\best\<your_tag>\best_model.zip --vecnorm models\best\<your_tag>\vecnormalize_best.pkl --logic-target-port R1
+python test.py --layout-mode logic_box_layout_inflow_u_fixed --model models\best\<your_tag>\best_model.zip --vecnorm models\best\<your_tag>\vecnormalize_best.pkl --logic-target-port R2
+```
+
 ## 5. 扫描圆柱数量 N 和最小半径 r_min（推荐）
 
 新增脚本：`batch_sweep_logic_n_rmin.py`

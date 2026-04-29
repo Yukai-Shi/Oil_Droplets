@@ -21,9 +21,10 @@ from stable_baselines3.common.utils import get_schedule_fn, update_learning_rate
 from envs.Wrapper import TaskContext, FollowerEnv, logic_box_ports, logic_target_port_set
 from envs.FluidEnv import FluidEnv
 from envs.Renderer import FluidRenderer
-from envs.SharedXYPolicy import SharedXYActorCriticPolicy
+from envs.SharedXYPolicy import SharedGeometryActorCriticPolicy, SharedXYActorCriticPolicy
 from utils.reseed import reseed_everything
 from config import (
+    GlobalOmegaControlConfig,
     LayoutModeConfig,
     LogicBoxConfig,
     StokesCylinderConfig,
@@ -115,6 +116,9 @@ AUTO_STAGE_ENABLE = bool(getattr(TrainingSettingConfig, "AUTO_STAGE_ENABLE", Fal
 AUTO_STAGE_EVALS_PER_PHASE = int(getattr(TrainingSettingConfig, "AUTO_STAGE_EVALS_PER_PHASE", 3))
 AUTO_STAGE_SNAPSHOT_TARGET = str(getattr(TrainingSettingConfig, "AUTO_STAGE_SNAPSHOT_TARGET", "")).strip().upper()
 SHARED_XY_ONE_STAGE_ENABLE = bool(getattr(TrainingSettingConfig, "SHARED_XY_ONE_STAGE_ENABLE", False))
+SHARED_GEOMETRY_ONE_STAGE_ENABLE = bool(
+    getattr(TrainingSettingConfig, "SHARED_GEOMETRY_ONE_STAGE_ENABLE", False)
+)
 
 PPO_CFG = dict(
     policy="MlpPolicy",
@@ -204,6 +208,15 @@ def parse_train_args():
         help=(
             "Enable one-stage shared-xy policy: x/y branch is target-agnostic, "
             "r/omega/inflow branch is target-aware."
+        ),
+    )
+    parser.add_argument(
+        "--shared-geometry-one-stage-enable",
+        action="store_true",
+        default=SHARED_GEOMETRY_ONE_STAGE_ENABLE,
+        help=(
+            "Enable one-stage shared-geometry policy: x/y/r branch is target-agnostic, "
+            "omega/inflow tail is target-aware."
         ),
     )
     parser.add_argument(
@@ -341,6 +354,7 @@ def _build_compact_eval_title(reward_value: float, info0: dict, base_mode: str) 
         lout = info0.get("logic_outlet_error", None)
         dead_cnt = info0.get("inactive_count", None)
         total_cnt = info0.get("total_count", None)
+        omega = info0.get("global_omega", None)
         ltgt = info0.get("logic_episode_target_port", info0.get("logic_target_port", None))
         lset = info0.get("logic_route_set_idx", None)
         if ltgt is not None:
@@ -354,6 +368,8 @@ def _build_compact_eval_title(reward_value: float, info0: dict, base_mode: str) 
             title += f" | miss:{float(lmis):.2f}"
         if lout is not None:
             title += f" | out:{float(lout):.2f}"
+        if omega is not None:
+            title += f" | om:{float(omega):.3f}"
         if dead_cnt is not None and total_cnt is not None:
             title += f" | dead:{int(dead_cnt)}/{int(total_cnt)}"
         return title
@@ -497,6 +513,15 @@ def render_evaluation_run(
                 for p in logic_route_pairs
                 if isinstance(p, (list, tuple)) and len(p) == 2
             ]
+        if str(logic_route_mode).strip().lower() in {
+            "single_multi_target",
+            "single_source_multi_target",
+            "one_to_many",
+            "one_to_three",
+        }:
+            src_name = str(logic_src) if logic_src is not None else str(LogicBoxConfig.SOURCE_PORT)
+            tgt_name = str(logic_tgt) if logic_tgt is not None else str(LogicBoxConfig.TARGET_PORT)
+            route_pairs = [[src_name.upper(), tgt_name.upper()]]
         if len(route_pairs) > 0:
             for src_name, _ in route_pairs:
                 src_info = ports.get(str(src_name).upper(), None)
@@ -1153,6 +1178,7 @@ if __name__ == "__main__":
     AUTO_STAGE_EVALS_PER_PHASE = max(1, int(args.auto_stage_evals_per_phase))
     AUTO_STAGE_SNAPSHOT_TARGET = str(args.auto_stage_snapshot_target).strip().upper()
     SHARED_XY_ONE_STAGE_ENABLE = bool(args.shared_xy_one_stage_enable)
+    SHARED_GEOMETRY_ONE_STAGE_ENABLE = bool(args.shared_geometry_one_stage_enable)
 
     LayoutModeConfig.LAYOUT_MODE = LAYOUT_MODE
     TrainingSettingConfig.PATH_TYPE = PATH_TYPE
@@ -1194,18 +1220,36 @@ if __name__ == "__main__":
         if bool(getattr(LogicBoxConfig, "FIXED_LAYOUT_ENABLE", False)):
             fx = np.asarray(getattr(LogicBoxConfig, "FIXED_LAYOUT_X", []), dtype=np.float32).reshape(-1)
             fy = np.asarray(getattr(LogicBoxConfig, "FIXED_LAYOUT_Y", []), dtype=np.float32).reshape(-1)
-            if fx.size != int(StokesCylinderConfig.NUM_CYLINDERS) or fy.size != int(StokesCylinderConfig.NUM_CYLINDERS):
+            fr = np.asarray(getattr(LogicBoxConfig, "FIXED_LAYOUT_R", []), dtype=np.float32).reshape(-1)
+            fixed_geom = bool(getattr(LogicBoxConfig, "FIXED_GEOMETRY_ENABLE", False))
+            if (
+                fx.size != int(StokesCylinderConfig.NUM_CYLINDERS)
+                or fy.size != int(StokesCylinderConfig.NUM_CYLINDERS)
+                or (fixed_geom and fr.size != int(StokesCylinderConfig.NUM_CYLINDERS))
+            ):
                 LogicBoxConfig.FIXED_LAYOUT_ENABLE = False
+                LogicBoxConfig.FIXED_GEOMETRY_ENABLE = False
                 print(
-                    "[Override] FIXED_LAYOUT_ENABLE=False (fixed center length mismatch with NUM_CYLINDERS)."
+                    "[Override] FIXED_LAYOUT_ENABLE=False (fixed geometry length mismatch with NUM_CYLINDERS)."
                 )
         if SHARED_XY_ONE_STAGE_ENABLE:
             LogicBoxConfig.FIXED_LAYOUT_ENABLE = False
+            LogicBoxConfig.FIXED_GEOMETRY_ENABLE = False
             LogicBoxConfig.KEEP_XY_ACTION_WHEN_FIXED = True
             # Shared-xy one-stage conflicts conceptually with phase switching.
             AUTO_STAGE_ENABLE = False
             BOOTSTRAP_FIXED_LAYOUT = False
             print("[TrainConfig] shared-xy one-stage enabled: force FIXED_LAYOUT_ENABLE=False, disable auto-stage.")
+        if SHARED_GEOMETRY_ONE_STAGE_ENABLE:
+            LogicBoxConfig.FIXED_LAYOUT_ENABLE = False
+            LogicBoxConfig.FIXED_GEOMETRY_ENABLE = False
+            LogicBoxConfig.KEEP_XY_ACTION_WHEN_FIXED = True
+            AUTO_STAGE_ENABLE = False
+            BOOTSTRAP_FIXED_LAYOUT = False
+            print(
+                "[TrainConfig] shared-geometry one-stage enabled: "
+                "x/y/r target-agnostic, tail controls target-aware."
+            )
         if AUTO_STAGE_ENABLE and (not bool(getattr(LogicBoxConfig, "KEEP_XY_ACTION_WHEN_FIXED", False))):
             LogicBoxConfig.KEEP_XY_ACTION_WHEN_FIXED = True
             print("[TrainConfig] auto-enable KEEP_XY_ACTION_WHEN_FIXED=True for auto stage switching.")
@@ -1256,6 +1300,9 @@ if __name__ == "__main__":
         f"inactive_r={float(getattr(LogicBoxConfig, 'INACTIVE_LOCK_R', 0.0)):.4f} "
         f"min_active_r={float(getattr(LogicBoxConfig, 'MIN_ACTIVE_R', 0.0)):.4f} "
         f"forbid_elim={bool(getattr(LogicBoxConfig, 'FORBID_ELIMINATION', False))} "
+        f"fixed_geom={bool(getattr(LogicBoxConfig, 'FIXED_GEOMETRY_ENABLE', False))} "
+        f"omega=({float(getattr(GlobalOmegaControlConfig, 'OMEGA_MIN', 0.0)):.3f},"
+        f"{float(getattr(GlobalOmegaControlConfig, 'OMEGA_MAX', 0.0)):.3f}) "
         f"steps={TOTAL_TIMESTEPS} eval_freq={EVAL_FREQ} log_interval={LOG_INTERVAL} "
         f"workers={WORKERS} seed={SEED} "
         f"init_model={'yes' if len(INIT_MODEL)>0 else 'no'} "
@@ -1263,6 +1310,7 @@ if __name__ == "__main__":
         f"reset_ts={RESET_NUM_TIMESTEPS} "
         f"lr_override={LEARNING_RATE_OVERRIDE if LEARNING_RATE_OVERRIDE is not None else 'none'} "
         f"shared_xy_one_stage={SHARED_XY_ONE_STAGE_ENABLE} "
+        f"shared_geom_one_stage={SHARED_GEOMETRY_ONE_STAGE_ENABLE} "
         f"auto_stage={AUTO_STAGE_ENABLE} auto_stage_evals={AUTO_STAGE_EVALS_PER_PHASE} "
         f"auto_stage_tgt={AUTO_STAGE_SNAPSHOT_TARGET or 'env'} "
         f"save_eval_preview={SAVE_EVAL_PREVIEW} save_best_preview={SAVE_BEST_PREVIEW} "
@@ -1328,7 +1376,9 @@ if __name__ == "__main__":
             _override_model_learning_rate(model, LEARNING_RATE_OVERRIDE)
     else:
         policy_cls = PPO_CFG["policy"]
-        if SHARED_XY_ONE_STAGE_ENABLE and base_mode == "logic_box_layout":
+        if SHARED_GEOMETRY_ONE_STAGE_ENABLE and base_mode == "logic_box_layout":
+            policy_cls = SharedGeometryActorCriticPolicy
+        elif SHARED_XY_ONE_STAGE_ENABLE and base_mode == "logic_box_layout":
             policy_cls = SharedXYActorCriticPolicy
         ppo_kwargs = {k: v for k, v in PPO_CFG.items() if k != "policy"}
         if LEARNING_RATE_OVERRIDE is not None:

@@ -180,8 +180,8 @@ class LogicBoxConfig:
     # - "multi_map_switch": episode-wise switch among multiple route maps.
     #   Each map is still evaluated as 3 inlets simultaneously routing to 3 outlets.
     # - "single_multi_target": fixed SOURCE_PORT, per-episode target sampled from TARGET_PORT_SET
-    ROUTE_MODE = "multi_map_switch"
-    TARGET_PORT_SET = ["T0", "R0", "R2"]
+    ROUTE_MODE = "single_multi_target"
+    TARGET_PORT_SET = ["R0", "R1", "R2"]
     # Target sampling mode for single_multi_target training:
     # - "random": uniform random from TARGET_PORT_SET
     # - "cycle": round-robin over TARGET_PORT_SET (recommended for balance)
@@ -228,13 +228,16 @@ class LogicBoxConfig:
     # Weights aligned with MULTI_ROUTE_SETS when sample mode is weighted.
     MULTI_ROUTE_SET_WEIGHTS = [1.0, 1.0]
 
-    # Whether logic-box uses fixed cylinder centers (only radii are optimized).
-    # This is useful for "fixed layout + variable radius/omega" tasks.
-    FIXED_LAYOUT_ENABLE = True
+    # Whether logic-box uses fixed cylinder centers.
+    FIXED_LAYOUT_ENABLE = False
+    # If True, logic-box uses fixed centers and fixed radii; policy controls
+    # only tail controls such as global omega. Use with *_inflow_u_fixed to
+    # make omega the only trainable physical control.
+    FIXED_GEOMETRY_ENABLE = False
     # Keep logic-box policy action dimension as x/y/r even when FIXED_LAYOUT_ENABLE=True.
     # This allows seamless stage switching (layout-search -> fixed-layout fine-tune)
     # without changing policy output dimension.
-    KEEP_XY_ACTION_WHEN_FIXED = True
+    KEEP_XY_ACTION_WHEN_FIXED = False
     # Default fixed centers (3x3 cylinders) inside local box.
     # You can replace these arrays with your own fixed arrangement.
     FIXED_LAYOUT_X = np.array(
@@ -243,6 +246,10 @@ class LogicBoxConfig:
     )
     FIXED_LAYOUT_Y = np.array(
         [0.080, 0.080, 0.080, 0.000, 0.000, 0.000, -0.080, -0.080, -0.080],
+        dtype=np.float32,
+    )
+    FIXED_LAYOUT_R = np.array(
+        [0.014, 0.014, 0.014, 0.014, 0.014, 0.014, 0.014, 0.014, 0.014],
         dtype=np.float32,
     )
 
@@ -282,11 +289,11 @@ class LogicBoxConfig:
     # MAX_R_AUTO_SCALE_TO_BOUNDS=True, it scales with logic bounds size.
     MAX_R = 0.020
     MAX_R_AUTO_SCALE_TO_BOUNDS = False
-    EXIST_THRESHOLD = 0.0045
+    EXIST_THRESHOLD = 0.0
     # Hard floor on active radius in logic-box mode (when FORBID_ELIMINATION=True).
-    MIN_ACTIVE_R = 0.005
+    MIN_ACTIVE_R = 0.0005
     # If True, logic-box radii are clamped to at least MIN_ACTIVE_R (no r=0 elimination).
-    FORBID_ELIMINATION = False
+    FORBID_ELIMINATION = True
     # Radius <= KILLED_EPS is counted as "eliminated" in diagnostics.
     KILLED_EPS = 1e-6
     # Stage-wise active-cylinder gate (optional):
@@ -350,7 +357,7 @@ class TrainingSettingConfig:
     PATH_TYPE = "logic_route"
     # Optional custom suffix appended to task result folder/tag.
     # Example: RUN_ALIAS = "omega_r_only_v1"
-    RUN_ALIAS = "one2three_mean_Nonvoerlap"
+    RUN_ALIAS = "omega_switch_train_geom"
     # Train-time diagnostics rollout for visualization only.
     RUN_DIAGNOSTIC_ROLLOUT = False
     # Visualization output switches:
@@ -375,6 +382,11 @@ class TrainingSettingConfig:
     # - r/omega/inflow is optimized by a target-aware actor branch
     # Requires logic_box free-layout action shape.
     SHARED_XY_ONE_STAGE_ENABLE = False
+    # One-stage shared-geometry policy:
+    # - x/y/r are optimized by a target-agnostic actor branch
+    # - omega/inflow tail is optimized by a target-aware actor branch
+    # This is for "learn one fixed geometry, switch outlets by omega only".
+    SHARED_GEOMETRY_ONE_STAGE_ENABLE = True
 
 
 class RankineSettingConfig:

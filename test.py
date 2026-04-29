@@ -21,7 +21,7 @@ from config import (
 )
 from envs.FluidEnv import FluidEnv
 from envs.Renderer import FluidRenderer
-from envs.SharedXYPolicy import SharedXYActorCriticPolicy  # noqa: F401
+from envs.SharedXYPolicy import SharedGeometryActorCriticPolicy, SharedXYActorCriticPolicy  # noqa: F401
 from envs.Wrapper import FollowerEnv, TaskContext
 
 
@@ -107,6 +107,7 @@ def load_policy_action(
     model_path: str,
     vecnorm_path: str,
     layout_mode: str,
+    logic_target_port: Optional[str] = None,
     logic_route_set_idx: Optional[int] = None,
 ):
     """
@@ -119,6 +120,8 @@ def load_policy_action(
             layout_mode=layout_mode,
         )
         _env = FollowerEnv(fluid_env=_fe, ctx=_ctx, logic_seed_profile="eval")
+        if logic_target_port is not None and hasattr(_env, "set_logic_forced_target_port"):
+            _env.set_logic_forced_target_port(str(logic_target_port).upper())
         if logic_route_set_idx is not None and hasattr(_env, "set_logic_forced_route_set_idx"):
             _env.set_logic_forced_route_set_idx(int(logic_route_set_idx))
         _vec = DummyVecEnv([lambda: _env])
@@ -165,6 +168,7 @@ def run_long_rollout(
     show_target_point: bool,
     show_target_path: bool,
     hide_logic_seeds: bool,
+    logic_target_port: Optional[str] = None,
     logic_route_set_idx: Optional[int] = None,
 ):
     ctx = TaskContext()
@@ -173,6 +177,8 @@ def run_long_rollout(
         layout_mode=layout_mode,
     )
     env = FollowerEnv(fluid_env=fe, ctx=ctx, logic_seed_profile="eval")
+    if logic_target_port is not None and hasattr(env, "set_logic_forced_target_port"):
+        env.set_logic_forced_target_port(str(logic_target_port).upper())
     if logic_route_set_idx is not None and hasattr(env, "set_logic_forced_route_set_idx"):
         env.set_logic_forced_route_set_idx(int(logic_route_set_idx))
     renderer = FluidRenderer()
@@ -271,6 +277,11 @@ def parse_args():
     )
     parser.add_argument("--layout-mode", default=LayoutModeConfig.LAYOUT_MODE)
     parser.add_argument(
+        "--logic-target-port",
+        default=None,
+        help="Force target port in single_multi_target mode, e.g. R0/R1/R2/T0/B0.",
+    )
+    parser.add_argument(
         "--logic-route-set-idx",
         type=int,
         default=None,
@@ -310,7 +321,12 @@ def parse_args():
 def main():
     args = parse_args()
     base_tag = build_task_tag(args.layout_mode)
-    out = args.out or f"models/best/{base_tag}/rollout/long_rollout_{base_tag}.gif"
+    target_suffix = (
+        f"_{str(args.logic_target_port).upper()}"
+        if args.logic_target_port is not None and len(str(args.logic_target_port).strip()) > 0
+        else ""
+    )
+    out = args.out or f"models/best/{base_tag}/rollout/long_rollout_{base_tag}{target_suffix}.gif"
     default_model, default_vecnorm = default_model_paths(args.layout_mode)
 
     model_path = args.model or default_model
@@ -332,7 +348,7 @@ def main():
     print(
         f"[Config] mode={args.layout_mode}, rollout_steps={args.rollout_steps}, "
         f"frame_stride={args.frame_stride}, fps={args.fps}, model={model_path}, "
-        f"route_set_idx={args.logic_route_set_idx}"
+        f"target_port={args.logic_target_port}, route_set_idx={args.logic_route_set_idx}"
     )
 
     base_mode, _ = parse_layout_mode(args.layout_mode)
@@ -352,6 +368,7 @@ def main():
         model_path=model_path,
         vecnorm_path=vecnorm_path,
         layout_mode=args.layout_mode,
+        logic_target_port=args.logic_target_port,
         logic_route_set_idx=args.logic_route_set_idx,
     )
     print(f"[Action] decoded_dim={physical_action.shape[0]}")
@@ -366,6 +383,7 @@ def main():
         show_target_point=args.show_target_point,
         show_target_path=(not hide_target_path),
         hide_logic_seeds=hide_logic_seeds,
+        logic_target_port=args.logic_target_port,
         logic_route_set_idx=args.logic_route_set_idx,
     )
 

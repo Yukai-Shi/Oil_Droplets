@@ -92,6 +92,10 @@ class FluidEnv:
             self.fixed_count = 0
             self.design_n = self.max_n
             self.logic_fixed_layout = bool(getattr(LogicBoxConfig, "FIXED_LAYOUT_ENABLE", False))
+            self.logic_fixed_geometry = bool(
+                self.logic_fixed_layout
+                and getattr(LogicBoxConfig, "FIXED_GEOMETRY_ENABLE", False)
+            )
             if self.logic_fixed_layout:
                 fx = np.asarray(getattr(LogicBoxConfig, "FIXED_LAYOUT_X", []), dtype=np.float32).reshape(-1)
                 fy = np.asarray(getattr(LogicBoxConfig, "FIXED_LAYOUT_Y", []), dtype=np.float32).reshape(-1)
@@ -101,17 +105,32 @@ class FluidEnv:
                     )
                 self.logic_fixed_x = fx.copy()
                 self.logic_fixed_y = fy.copy()
+                if self.logic_fixed_geometry:
+                    fr = np.asarray(
+                        getattr(LogicBoxConfig, "FIXED_LAYOUT_R", []),
+                        dtype=np.float32,
+                    ).reshape(-1)
+                    if fr.size != self.max_n:
+                        raise ValueError(
+                            f"LogicBox fixed geometry expects {self.max_n} radii, got r={fr.size}"
+                        )
+                    self.logic_fixed_r = np.maximum(fr, 0.0).astype(np.float32)
+                else:
+                    self.logic_fixed_r = None
             else:
                 self.logic_fixed_x = None
                 self.logic_fixed_y = None
+                self.logic_fixed_r = None
         else:
             self.max_n = StokesCylinderConfig.NUM_CYLINDERS
             self.grid_x, self.grid_y = None, None
             self.fixed_count = 0
             self.design_n = self.max_n
             self.logic_fixed_layout = False
+            self.logic_fixed_geometry = False
             self.logic_fixed_x = None
             self.logic_fixed_y = None
+            self.logic_fixed_r = None
 
         self.default_omega = float(StokesCylinderConfig.FIXED_OMEGA)
         self.fixed_omega = float(self.default_omega)
@@ -160,6 +179,8 @@ class FluidEnv:
         elif self.base_layout_mode == "logic_box_layout" and self.logic_fixed_layout:
             self.cylinders_x[:] = self.logic_fixed_x
             self.cylinders_y[:] = self.logic_fixed_y
+            if self.logic_fixed_geometry and self.logic_fixed_r is not None:
+                self.cylinders_r[:] = self.logic_fixed_r
         else:
             self.cylinders_x.fill(0.0)
             self.cylinders_y.fill(0.0)
@@ -311,12 +332,20 @@ class FluidEnv:
         layout_vec = action_vec
         tail_dim = self.inflow_action_dim + self.omega_action_dim
         if tail_dim > 0:
-            if action_vec.size <= tail_dim:
+            allow_tail_only = bool(
+                self.base_layout_mode == "logic_box_layout"
+                and getattr(self, "logic_fixed_geometry", False)
+            )
+            if action_vec.size < tail_dim or (action_vec.size == tail_dim and not allow_tail_only):
                 raise ValueError(
                     f"Action dim too small for layout+tail controls, got {action_vec.size}"
                 )
-            layout_vec = action_vec[:-tail_dim]
-            tail_vec = action_vec[-tail_dim:]
+            if action_vec.size == tail_dim:
+                layout_vec = np.empty((0,), dtype=np.float32)
+                tail_vec = action_vec
+            else:
+                layout_vec = action_vec[:-tail_dim]
+                tail_vec = action_vec[-tail_dim:]
             k = 0
             if self.inflow_action_dim > 0:
                 if self.inflow_control_enabled:
@@ -392,6 +421,12 @@ class FluidEnv:
             self.cylinders_r[self.fixed_count :] = _clip_design_radii(new_layout[:, 2], r_high)
             return
         if self.base_layout_mode == "logic_box_layout":
+            if getattr(self, "logic_fixed_geometry", False):
+                self.cylinders_x[:] = self.logic_fixed_x
+                self.cylinders_y[:] = self.logic_fixed_y
+                self.cylinders_r[:] = self.logic_fixed_r
+                return
+
             (x0, x1), (y0, y1) = get_logic_box_ranges()
             margin = 1e-4
             max_box_r = max(
@@ -561,6 +596,7 @@ class FluidEnv:
             self.cylinders_y[:] = self.logic_fixed_y
         else:
             self.logic_fixed_layout = False
+            self.logic_fixed_geometry = False
 
     def step(self, action: np.ndarray = None):
         self.step_count += 1
