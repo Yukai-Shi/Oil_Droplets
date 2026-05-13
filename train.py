@@ -21,9 +21,14 @@ from stable_baselines3.common.utils import get_schedule_fn, update_learning_rate
 from envs.Wrapper import TaskContext, FollowerEnv, logic_box_ports, logic_target_port_set
 from envs.FluidEnv import FluidEnv
 from envs.Renderer import FluidRenderer
-from envs.SharedXYPolicy import SharedGeometryActorCriticPolicy, SharedXYActorCriticPolicy
+from envs.SharedXYPolicy import (
+    SharedGeometryActorCriticPolicy,
+    SharedXYActorCriticPolicy,
+    StructureControlActorCriticPolicy,
+)
 from utils.reseed import reseed_everything
 from config import (
+    DynamicOmegaControlConfig,
     GlobalOmegaControlConfig,
     LayoutModeConfig,
     LogicBoxConfig,
@@ -32,6 +37,10 @@ from config import (
     get_logic_box_ranges,
     get_logic_multi_route_pairs,
     get_logic_multi_route_sets,
+    is_dynamic_omega_design_mode,
+    is_dynamic_omega_mode,
+    is_dynamic_omega_radius_design_mode,
+    strip_dynamic_omega_suffix,
 )
 
 WORKERS = 1
@@ -40,7 +49,7 @@ PATH_TYPE = TrainingSettingConfig.PATH_TYPE
 
 
 def parse_layout_mode(layout_mode: str):
-    mode = str(layout_mode)
+    mode, _ = strip_dynamic_omega_suffix(str(layout_mode))
     if mode.endswith("_inflow_u_fixed"):
         return mode[:-15], True
     # Backward-compatible alias: *_inflow_u == *_inflow_u_fixed
@@ -119,6 +128,9 @@ SHARED_XY_ONE_STAGE_ENABLE = bool(getattr(TrainingSettingConfig, "SHARED_XY_ONE_
 SHARED_GEOMETRY_ONE_STAGE_ENABLE = bool(
     getattr(TrainingSettingConfig, "SHARED_GEOMETRY_ONE_STAGE_ENABLE", False)
 )
+STRUCTURE_CONTROL_POLICY_ENABLE = bool(
+    getattr(TrainingSettingConfig, "STRUCTURE_CONTROL_POLICY_ENABLE", False)
+)
 
 PPO_CFG = dict(
     policy="MlpPolicy",
@@ -132,7 +144,7 @@ PPO_CFG = dict(
 
 
 def parse_train_args():
-    parser = argparse.ArgumentParser(description="Train one-shot layout optimization")
+    parser = argparse.ArgumentParser(description="Train layout optimization or dynamic omega control")
     parser.add_argument("--layout-mode", default=LAYOUT_MODE)
     parser.add_argument("--path-type", default=PATH_TYPE)
     parser.add_argument("--source-port", default=str(getattr(LogicBoxConfig, "SOURCE_PORT", "L1")))
@@ -220,10 +232,33 @@ def parse_train_args():
         ),
     )
     parser.add_argument(
+        "--structure-control-policy-enable",
+        action="store_true",
+        default=STRUCTURE_CONTROL_POLICY_ENABLE,
+        help=(
+            "Enable two-timescale policy: global trainable x/y/r structure "
+            "plus target-aware real-time control tail."
+        ),
+    )
+    parser.add_argument(
+        "--no-structure-control-policy",
+        action="store_false",
+        dest="structure_control_policy_enable",
+        help="Disable structure-control policy and fall back to the older shared-geometry policy.",
+    )
+    parser.add_argument(
         "--num-cylinders",
         type=int,
         default=None,
         help="Override StokesCylinderConfig.NUM_CYLINDERS for this run.",
+    )
+    parser.add_argument(
+        "--fixed-geometry-npz",
+        default="",
+        help=(
+            "Load fixed logic-box geometry from an .npz with arrays x/y/r. "
+            "This sets NUM_CYLINDERS and FIXED_LAYOUT_X/Y/R for the run."
+        ),
     )
     parser.add_argument(
         "--logic-min-active-r",
@@ -347,31 +382,24 @@ def bootstrap_logic_fixed_layout_from_model(model_path: str, vecnorm_path: str, 
 
 
 def _build_compact_eval_title(reward_value: float, info0: dict, base_mode: str) -> str:
-    title = f"One-Shot Eval | R:{float(reward_value):.2f}"
+    title = f"R:{float(reward_value):.2f}"
     if base_mode == "logic_box_layout":
-        lfit = info0.get("logic_path_fit_error", None)
         lmis = info0.get("logic_miss_ratio", None)
         lout = info0.get("logic_outlet_error", None)
-        dead_cnt = info0.get("inactive_count", None)
-        total_cnt = info0.get("total_count", None)
         omega = info0.get("global_omega", None)
-        ltgt = info0.get("logic_episode_target_port", info0.get("logic_target_port", None))
-        lset = info0.get("logic_route_set_idx", None)
-        if ltgt is not None:
-            title += f" | tgt:{str(ltgt).upper()}"
-        if lset is not None:
-            title += f" | m:{int(lset)}"
+        omega_trace = info0.get("omega_trace", None)
         # Keep title short to avoid overlap with in-axes annotations.
-        if lfit is not None:
-            title += f" | fit:{float(lfit):.3f}"
         if lmis is not None:
             title += f" | miss:{float(lmis):.2f}"
         if lout is not None:
             title += f" | out:{float(lout):.2f}"
-        if omega is not None:
-            title += f" | om:{float(omega):.3f}"
-        if dead_cnt is not None and total_cnt is not None:
-            title += f" | dead:{int(dead_cnt)}/{int(total_cnt)}"
+        if isinstance(omega_trace, (list, tuple, np.ndarray)) and len(omega_trace) >= 2:
+            f0 = float(omega_trace[0]) / (2.0 * np.pi)
+            f1 = float(omega_trace[-1]) / (2.0 * np.pi)
+            title += f" | f:{f0:.2f}->{f1:.2f} Hz"
+        elif omega is not None:
+            freq_hz = float(omega) / (2.0 * np.pi)
+            title += f" | f:{freq_hz:.2f} Hz"
         return title
 
     if base_mode == "gate3_layout":
@@ -424,10 +452,19 @@ def render_evaluation_run(
     renderer = FluidRenderer()
 
     obs = vec_env.reset()
-    action, _ = model.predict(obs, deterministic=True)
-    obs, reward, done, info = vec_env.step(action)
+    total_reward = 0.0
+    info0 = {}
+    max_steps = max(1, int(getattr(DynamicOmegaControlConfig, "MAX_STEPS", 160)) + 2)
+    for _ in range(max_steps):
+        action, _ = model.predict(obs, deterministic=True)
+        obs, reward, done, info = vec_env.step(action)
+        total_reward += float(reward[0]) if isinstance(reward, (list, tuple, np.ndarray)) else float(reward)
+        info0 = info[0]
+        done0 = bool(done[0]) if isinstance(done, (list, tuple, np.ndarray)) else bool(done)
+        if done0:
+            break
+    reward = np.array([total_reward], dtype=np.float32)
 
-    info0 = info[0]
     mean_path_dist = info0.get("mean_path_dist", None)
     final_dist = info0.get("final_dist", None)
     block_pen = info0.get("path_block_penalty", None)
@@ -862,22 +899,27 @@ class EvalCallbackWithEarlyStop(EvalCallback):
             self.eval_env.env_method("set_logic_forced_target_port", tgt)
         except Exception:
             pass
+        return self._evaluate_current_episode()
+
+    def _evaluate_current_episode(self):
         obs = self.eval_env.reset()
-        action, _ = self.model.predict(obs, deterministic=True)
-        _, reward, _, info = self.eval_env.step(action)
-        info0 = info[0] if isinstance(info, (list, tuple)) else info
-        r = float(reward[0]) if isinstance(reward, (list, tuple, np.ndarray)) else float(reward)
-        return r, info0
+        total_reward = 0.0
+        info0 = {}
+        max_steps = max(1, int(getattr(DynamicOmegaControlConfig, "MAX_STEPS", 160)) + 2)
+        for _ in range(max_steps):
+            action, _ = self.model.predict(obs, deterministic=True)
+            obs, reward, done, info = self.eval_env.step(action)
+            total_reward += float(reward[0]) if isinstance(reward, (list, tuple, np.ndarray)) else float(reward)
+            info0 = info[0] if isinstance(info, (list, tuple)) else info
+            done0 = bool(done[0]) if isinstance(done, (list, tuple, np.ndarray)) else bool(done)
+            if done0:
+                break
+        return float(total_reward), info0
 
     def _evaluate_forced_route_set_reward(self, route_set_idx: int):
         idx = int(route_set_idx)
         self._set_logic_forced_route_set(self.eval_env, idx)
-        obs = self.eval_env.reset()
-        action, _ = self.model.predict(obs, deterministic=True)
-        _, reward, _, info = self.eval_env.step(action)
-        info0 = info[0] if isinstance(info, (list, tuple)) else info
-        r = float(reward[0]) if isinstance(reward, (list, tuple, np.ndarray)) else float(reward)
-        return r, info0
+        return self._evaluate_current_episode()
 
     def _evaluate_single_multi_target_metric(self):
         targets = [str(t).upper() for t in logic_target_port_set()]
@@ -1179,6 +1221,7 @@ if __name__ == "__main__":
     AUTO_STAGE_SNAPSHOT_TARGET = str(args.auto_stage_snapshot_target).strip().upper()
     SHARED_XY_ONE_STAGE_ENABLE = bool(args.shared_xy_one_stage_enable)
     SHARED_GEOMETRY_ONE_STAGE_ENABLE = bool(args.shared_geometry_one_stage_enable)
+    STRUCTURE_CONTROL_POLICY_ENABLE = bool(args.structure_control_policy_enable)
 
     LayoutModeConfig.LAYOUT_MODE = LAYOUT_MODE
     TrainingSettingConfig.PATH_TYPE = PATH_TYPE
@@ -1191,6 +1234,9 @@ if __name__ == "__main__":
         print(f"[Override] NUM_CYLINDERS={StokesCylinderConfig.NUM_CYLINDERS}")
 
     base_mode, _ = parse_layout_mode(LAYOUT_MODE)
+    dynamic_omega_mode = bool(is_dynamic_omega_mode(LAYOUT_MODE))
+    dynamic_omega_design_mode = bool(is_dynamic_omega_design_mode(LAYOUT_MODE))
+    dynamic_omega_radius_design_mode = bool(is_dynamic_omega_radius_design_mode(LAYOUT_MODE))
     if base_mode == "logic_box_layout":
         LogicBoxConfig.ROUTE_MODE = str(args.logic_route_mode).strip().lower()
         LogicBoxConfig.SOURCE_PORT = str(args.source_port).upper()
@@ -1201,6 +1247,30 @@ if __name__ == "__main__":
             if len(parsed_tgts) > 0:
                 LogicBoxConfig.TARGET_PORT_SET = parsed_tgts
                 print(f"[Override] TARGET_PORT_SET={LogicBoxConfig.TARGET_PORT_SET}")
+        fixed_geometry_npz = str(args.fixed_geometry_npz).strip()
+        if len(fixed_geometry_npz) > 0:
+            if not os.path.isfile(fixed_geometry_npz):
+                raise FileNotFoundError(f"Fixed geometry npz not found: {fixed_geometry_npz}")
+            geom = np.load(fixed_geometry_npz)
+            gx = np.asarray(geom["x"], dtype=np.float32).reshape(-1)
+            gy = np.asarray(geom["y"], dtype=np.float32).reshape(-1)
+            gr = np.asarray(geom["r"], dtype=np.float32).reshape(-1)
+            if gx.size <= 0 or gx.size != gy.size or gx.size != gr.size:
+                raise ValueError(
+                    f"Invalid fixed geometry in {fixed_geometry_npz}: "
+                    f"x={gx.size}, y={gy.size}, r={gr.size}"
+                )
+            StokesCylinderConfig.NUM_CYLINDERS = int(gx.size)
+            LogicBoxConfig.FIXED_LAYOUT_X = gx.copy()
+            LogicBoxConfig.FIXED_LAYOUT_Y = gy.copy()
+            LogicBoxConfig.FIXED_LAYOUT_R = np.maximum(gr, 0.0).astype(np.float32)
+            LogicBoxConfig.FIXED_LAYOUT_ENABLE = True
+            LogicBoxConfig.FIXED_GEOMETRY_ENABLE = True
+            LogicBoxConfig.KEEP_XY_ACTION_WHEN_FIXED = False
+            print(
+                f"[Override] fixed geometry loaded: {fixed_geometry_npz} "
+                f"(N={StokesCylinderConfig.NUM_CYLINDERS})"
+            )
         if args.logic_min_active_r is not None:
             LogicBoxConfig.MIN_ACTIVE_R = float(args.logic_min_active_r)
             print(f"[Override] MIN_ACTIVE_R={LogicBoxConfig.MIN_ACTIVE_R}")
@@ -1216,6 +1286,41 @@ if __name__ == "__main__":
         if args.logic_forbid_elimination is not None:
             LogicBoxConfig.FORBID_ELIMINATION = bool(args.logic_forbid_elimination)
             print(f"[Override] FORBID_ELIMINATION={LogicBoxConfig.FORBID_ELIMINATION}")
+        if dynamic_omega_mode:
+            GlobalOmegaControlConfig.OPTIMIZE_OMEGA = True
+            AUTO_STAGE_ENABLE = False
+            BOOTSTRAP_FIXED_LAYOUT = False
+            if dynamic_omega_radius_design_mode:
+                LogicBoxConfig.FIXED_LAYOUT_ENABLE = True
+                LogicBoxConfig.FIXED_GEOMETRY_ENABLE = False
+                LogicBoxConfig.KEEP_XY_ACTION_WHEN_FIXED = False
+                SHARED_XY_ONE_STAGE_ENABLE = False
+                SHARED_GEOMETRY_ONE_STAGE_ENABLE = False
+                STRUCTURE_CONTROL_POLICY_ENABLE = True
+                print(
+                    "[TrainConfig] dynamic omega radius-design mode: fixed x/y centers, "
+                    "episode-locked trainable radii, and per-step omega control."
+                )
+            elif dynamic_omega_design_mode:
+                LogicBoxConfig.FIXED_LAYOUT_ENABLE = False
+                LogicBoxConfig.FIXED_GEOMETRY_ENABLE = False
+                LogicBoxConfig.KEEP_XY_ACTION_WHEN_FIXED = True
+                SHARED_XY_ONE_STAGE_ENABLE = False
+                SHARED_GEOMETRY_ONE_STAGE_ENABLE = True
+                print(
+                    "[TrainConfig] dynamic omega design mode: x/y/r selected once per episode, "
+                    "locked during rollout, and optimized across training; omega is controlled per step."
+                )
+            else:
+                LogicBoxConfig.FIXED_LAYOUT_ENABLE = True
+                LogicBoxConfig.FIXED_GEOMETRY_ENABLE = True
+                LogicBoxConfig.KEEP_XY_ACTION_WHEN_FIXED = False
+                SHARED_XY_ONE_STAGE_ENABLE = False
+                SHARED_GEOMETRY_ONE_STAGE_ENABLE = False
+                print(
+                    "[TrainConfig] dynamic omega mode: fixed x/y/r geometry, "
+                    "policy action is bounded delta-omega per step."
+                )
         # Keep fixed-layout safe when N is overridden.
         if bool(getattr(LogicBoxConfig, "FIXED_LAYOUT_ENABLE", False)):
             fx = np.asarray(getattr(LogicBoxConfig, "FIXED_LAYOUT_X", []), dtype=np.float32).reshape(-1)
@@ -1232,6 +1337,15 @@ if __name__ == "__main__":
                 print(
                     "[Override] FIXED_LAYOUT_ENABLE=False (fixed geometry length mismatch with NUM_CYLINDERS)."
                 )
+        if (
+            dynamic_omega_mode
+            and (not dynamic_omega_design_mode)
+            and not bool(getattr(LogicBoxConfig, "FIXED_GEOMETRY_ENABLE", False))
+        ):
+            raise ValueError(
+                "Dynamic omega mode needs FIXED_LAYOUT_X/Y/R length to match NUM_CYLINDERS. "
+                "Set --num-cylinders to that length or update LogicBoxConfig.FIXED_LAYOUT_*."
+            )
         if SHARED_XY_ONE_STAGE_ENABLE:
             LogicBoxConfig.FIXED_LAYOUT_ENABLE = False
             LogicBoxConfig.FIXED_GEOMETRY_ENABLE = False
@@ -1301,8 +1415,12 @@ if __name__ == "__main__":
         f"min_active_r={float(getattr(LogicBoxConfig, 'MIN_ACTIVE_R', 0.0)):.4f} "
         f"forbid_elim={bool(getattr(LogicBoxConfig, 'FORBID_ELIMINATION', False))} "
         f"fixed_geom={bool(getattr(LogicBoxConfig, 'FIXED_GEOMETRY_ENABLE', False))} "
+        f"dynamic_omega={dynamic_omega_mode} "
+        f"dynamic_omega_design={dynamic_omega_design_mode} "
+        f"dynamic_omega_radius_design={dynamic_omega_radius_design_mode} "
         f"omega=({float(getattr(GlobalOmegaControlConfig, 'OMEGA_MIN', 0.0)):.3f},"
         f"{float(getattr(GlobalOmegaControlConfig, 'OMEGA_MAX', 0.0)):.3f}) "
+        f"domega_max={float(getattr(DynamicOmegaControlConfig, 'MAX_DELTA_OMEGA', 0.0)):.3f} "
         f"steps={TOTAL_TIMESTEPS} eval_freq={EVAL_FREQ} log_interval={LOG_INTERVAL} "
         f"workers={WORKERS} seed={SEED} "
         f"init_model={'yes' if len(INIT_MODEL)>0 else 'no'} "
@@ -1311,6 +1429,7 @@ if __name__ == "__main__":
         f"lr_override={LEARNING_RATE_OVERRIDE if LEARNING_RATE_OVERRIDE is not None else 'none'} "
         f"shared_xy_one_stage={SHARED_XY_ONE_STAGE_ENABLE} "
         f"shared_geom_one_stage={SHARED_GEOMETRY_ONE_STAGE_ENABLE} "
+        f"structure_control={STRUCTURE_CONTROL_POLICY_ENABLE} "
         f"auto_stage={AUTO_STAGE_ENABLE} auto_stage_evals={AUTO_STAGE_EVALS_PER_PHASE} "
         f"auto_stage_tgt={AUTO_STAGE_SNAPSHOT_TARGET or 'env'} "
         f"save_eval_preview={SAVE_EVAL_PREVIEW} save_best_preview={SAVE_BEST_PREVIEW} "
@@ -1354,8 +1473,15 @@ if __name__ == "__main__":
     eval_env.training = False
     eval_env.norm_reward = False
 
+    layout_without_dynamic, _ = strip_dynamic_omega_suffix(LAYOUT_MODE)
     _, use_inflow = parse_layout_mode(LAYOUT_MODE)
-    use_inflow_warmup = bool(INFLOW_WARMUP_ENABLE and use_inflow)
+    fixed_inflow_mode = str(layout_without_dynamic).endswith(("_inflow_u_fixed", "_inflow_u"))
+    use_inflow_warmup = bool(
+        INFLOW_WARMUP_ENABLE
+        and use_inflow
+        and (not fixed_inflow_mode)
+        and (not dynamic_omega_mode)
+    )
     if use_inflow_warmup:
         try:
             vec_env.env_method("set_inflow_control_enabled", False)
@@ -1376,7 +1502,17 @@ if __name__ == "__main__":
             _override_model_learning_rate(model, LEARNING_RATE_OVERRIDE)
     else:
         policy_cls = PPO_CFG["policy"]
-        if SHARED_GEOMETRY_ONE_STAGE_ENABLE and base_mode == "logic_box_layout":
+        if (
+            STRUCTURE_CONTROL_POLICY_ENABLE
+            and dynamic_omega_design_mode
+            and base_mode == "logic_box_layout"
+        ):
+            policy_cls = StructureControlActorCriticPolicy
+            print(
+                "[TrainConfig] structure-control policy enabled: global x/y/r slow structure, "
+                "target-aware omega(t) feedback controller."
+            )
+        elif SHARED_GEOMETRY_ONE_STAGE_ENABLE and base_mode == "logic_box_layout":
             policy_cls = SharedGeometryActorCriticPolicy
         elif SHARED_XY_ONE_STAGE_ENABLE and base_mode == "logic_box_layout":
             policy_cls = SharedXYActorCriticPolicy
@@ -1410,7 +1546,7 @@ if __name__ == "__main__":
         verbose=1,
     )
 
-    print(f"Start training one-shot layout optimization | mode={LAYOUT_MODE}")
+    print(f"Start training | mode={LAYOUT_MODE}")
     model.learn(
         total_timesteps=TOTAL_TIMESTEPS,
         callback=[eval_cb],

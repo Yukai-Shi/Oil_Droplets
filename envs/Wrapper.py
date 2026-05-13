@@ -3,6 +3,7 @@ import numpy as np
 from gymnasium import spaces
 
 from config import (
+    DynamicOmegaControlConfig,
     FixedGrid3x3Config,
     Gate3LevelConfig,
     GlobalOmegaControlConfig,
@@ -16,6 +17,9 @@ from config import (
     RenderSettingConfig,
     StokesCylinderConfig,
     TrainingSettingConfig,
+    is_dynamic_omega_design_mode,
+    is_dynamic_omega_mode,
+    is_dynamic_omega_radius_design_mode,
 )
 from envs.FluidEnv import FluidEnv
 from utils.calc import calculate_point_velocity, is_legal
@@ -433,6 +437,54 @@ def _logic_exit_match_error(side: str, coord: float, target_side: str, target_xy
     else:
         d = abs(float(coord) - float(target_xy[0])) / sigma
     return float(d), True
+
+
+def _logic_box_segment_exit(p0: np.ndarray, p1: np.ndarray):
+    """Return first logic-box boundary crossing along segment p0 -> p1."""
+    (x0, x1), (y0, y1) = logic_box_bounds()
+    p0 = np.asarray(p0, dtype=np.float64).reshape(2)
+    p1 = np.asarray(p1, dtype=np.float64).reshape(2)
+    dx = float(p1[0] - p0[0])
+    dy = float(p1[1] - p0[1])
+    candidates = []
+
+    if abs(dx) > 1e-12:
+        a = (float(x1) - float(p0[0])) / dx
+        if 0.0 <= a <= 1.0:
+            candidates.append((float(a), "right", float(p0[1] + a * dy)))
+        a = (float(x0) - float(p0[0])) / dx
+        if 0.0 <= a <= 1.0:
+            candidates.append((float(a), "left", float(p0[1] + a * dy)))
+
+    if abs(dy) > 1e-12:
+        a = (float(y1) - float(p0[1])) / dy
+        if 0.0 <= a <= 1.0:
+            candidates.append((float(a), "top", float(p0[0] + a * dx)))
+        a = (float(y0) - float(p0[1])) / dy
+        if 0.0 <= a <= 1.0:
+            candidates.append((float(a), "bottom", float(p0[0] + a * dx)))
+
+    if len(candidates) > 0:
+        candidates.sort(key=lambda t: t[0])
+        _, side, coord = candidates[0]
+        return {"exited": True, "side": side, "coord": float(coord)}
+
+    if not (float(x0) <= float(p1[0]) <= float(x1) and float(y0) <= float(p1[1]) <= float(y1)):
+        # Fallback for numerical overshoot without a clean segment intersection.
+        over = {
+            "right": float(p1[0] - x1),
+            "left": float(x0 - p1[0]),
+            "top": float(p1[1] - y1),
+            "bottom": float(y0 - p1[1]),
+        }
+        side = max(over, key=over.get)
+        if side in {"left", "right"}:
+            coord = float(p1[1])
+        else:
+            coord = float(p1[0])
+        return {"exited": True, "side": side, "coord": coord}
+
+    return {"exited": False, "side": None, "coord": None}
 
 
 def trace_streamline_until_box_exit(
@@ -1304,6 +1356,19 @@ class FollowerEnv(gym.Env):
         self.ctx = ctx
         self.layout_mode = self.env.layout_mode
         self.base_layout_mode = self.env.base_layout_mode
+        self.dynamic_omega_control = bool(
+            self.base_layout_mode == "logic_box_layout"
+            and (
+                bool(getattr(self.env, "dynamic_omega_control", False))
+                or is_dynamic_omega_mode(self.layout_mode)
+            )
+        )
+        self.dynamic_omega_design_layout = bool(
+            self.dynamic_omega_control and is_dynamic_omega_design_mode(self.layout_mode)
+        )
+        self.dynamic_omega_radius_design_layout = bool(
+            self.dynamic_omega_control and is_dynamic_omega_radius_design_mode(self.layout_mode)
+        )
         self.logic_seed_profile = str(logic_seed_profile).strip().lower()
         self.logic_episode_source_port = str(getattr(LogicBoxConfig, "SOURCE_PORT", "L1")).upper()
         self.logic_episode_target_port = str(getattr(LogicBoxConfig, "TARGET_PORT", "R1")).upper()
@@ -1320,7 +1385,23 @@ class FollowerEnv(gym.Env):
             else logic_box_active_route_pairs()
         )
 
-        if self.base_layout_mode == "fixed_grid_3x3":
+        if self.dynamic_omega_control:
+            if self.dynamic_omega_radius_design_layout:
+                action_dim = self.env.max_n + 1
+            elif self.dynamic_omega_design_layout:
+                action_dim = self.env.max_n * 3 + 1
+            elif not bool(getattr(self.env, "logic_fixed_geometry", False)):
+                raise ValueError(
+                    "Dynamic omega mode requires LogicBoxConfig.FIXED_LAYOUT_ENABLE=True "
+                    "and FIXED_GEOMETRY_ENABLE=True so x/y/r stay fixed during the episode."
+                )
+            else:
+                action_dim = 1
+            if int(getattr(self.env, "omega_action_dim", 0)) <= 0:
+                raise ValueError(
+                    "Dynamic omega mode requires GlobalOmegaControlConfig.OPTIMIZE_OMEGA=True."
+                )
+        elif self.base_layout_mode == "fixed_grid_3x3":
             action_dim = self.env.max_n
         elif self.base_layout_mode == "gate3_layout":
             action_dim = self.env.design_n * 3
@@ -1336,8 +1417,9 @@ class FollowerEnv(gym.Env):
                 action_dim = self.env.max_n * 3
         else:
             action_dim = self.env.max_n * 3
-        action_dim += self.env.inflow_action_dim
-        action_dim += self.env.omega_action_dim
+        if not self.dynamic_omega_control:
+            action_dim += self.env.inflow_action_dim
+            action_dim += self.env.omega_action_dim
 
         self.action_space = spaces.Box(
             low=-1.0,
@@ -1347,7 +1429,7 @@ class FollowerEnv(gym.Env):
         )
 
         sample_state = self.env.get_state()
-        obs_dim = sample_state.shape[0] + 2
+        obs_dim = sample_state.shape[0] + 2 + (1 if self.dynamic_omega_control else 0)
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -1358,6 +1440,10 @@ class FollowerEnv(gym.Env):
         self.episode_return = 0.0
         self.prev_dist = None
         self.last_history = []
+        self.dynamic_step_count = 0
+        self.dynamic_episode_history = []
+        self.dynamic_omega_history = []
+        self.prev_omega = float(self.env.fixed_omega)
 
     def set_inflow_control_enabled(self, enabled: bool):
         if hasattr(self.env, "set_inflow_control_enabled"):
@@ -1583,7 +1669,15 @@ class FollowerEnv(gym.Env):
                         ],
                         dtype=np.float32,
                     )
-        return np.concatenate([raw_state, dxdy]).astype(np.float32)
+        obs_parts = [raw_state, dxdy]
+        if self.dynamic_omega_control:
+            om_min = float(getattr(GlobalOmegaControlConfig, "OMEGA_MIN", -1.0))
+            om_max = float(getattr(GlobalOmegaControlConfig, "OMEGA_MAX", 1.0))
+            om_scale = max(abs(om_min), abs(om_max), 1e-8)
+            obs_parts.append(
+                np.array([float(self.env.fixed_omega) / om_scale], dtype=np.float32)
+            )
+        return np.concatenate(obs_parts).astype(np.float32)
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -1705,10 +1799,24 @@ class FollowerEnv(gym.Env):
             self.ctx.generate_fixed_path(path_type=path_type)
         ini_pos = np.array(self.ctx.path[0], dtype=np.float32)
         self.env.reset(ini_pos)
+        if self.dynamic_omega_control:
+            self.env.fixed_omega = float(
+                np.clip(
+                    float(getattr(DynamicOmegaControlConfig, "START_OMEGA", 0.0)),
+                    float(getattr(GlobalOmegaControlConfig, "OMEGA_MIN", -np.inf)),
+                    float(getattr(GlobalOmegaControlConfig, "OMEGA_MAX", np.inf)),
+                )
+            )
+            self.prev_omega = float(self.env.fixed_omega)
+            self.dynamic_step_count = 0
+            self.dynamic_omega_history = [float(self.env.fixed_omega)]
         self.ctx.particle_pos = ini_pos.copy()
 
         self.episode_return = 0.0
         self.last_history = [tuple(ini_pos)]
+        self.dynamic_episode_history = [tuple(ini_pos)]
+        if not self.dynamic_omega_control:
+            self.dynamic_omega_history = []
 
         dx = self.ctx.goal[0] - self.ctx.particle_pos[0]
         dy = self.ctx.goal[1] - self.ctx.particle_pos[1]
@@ -1716,7 +1824,338 @@ class FollowerEnv(gym.Env):
 
         return self._get_obs(), {}
 
+    def _dynamic_target_info(self):
+        ports = logic_box_ports()
+        src = str(self.logic_episode_source_port or getattr(LogicBoxConfig, "SOURCE_PORT", "L1")).upper()
+        tgt = str(self.logic_episode_target_port or getattr(LogicBoxConfig, "TARGET_PORT", "R1")).upper()
+        if src not in ports:
+            src = "L1"
+        if tgt not in ports:
+            tgt = "R1"
+        tgt_side, tgt_xy = ports[tgt]
+        return src, tgt, str(tgt_side), np.asarray(tgt_xy, dtype=np.float32)
+
+    def _decode_dynamic_geometry_layout(self, layout_action: np.ndarray) -> np.ndarray:
+        r_low = float(getattr(LogicBoxConfig, "MIN_R", StokesCylinderConfig.MIN_R))
+        r_high = StokesCylinderConfig.MAX_R
+        (x_low, x_high), (y_low, y_high) = logic_box_bounds()
+        logic_r_high = min(float(r_high), float(get_logic_max_radius()))
+        a = np.asarray(layout_action, dtype=np.float32).reshape(self.env.max_n, 3).copy()
+        a[:, 0] = x_low + 0.5 * (a[:, 0] + 1.0) * (x_high - x_low)
+        a[:, 1] = y_low + 0.5 * (a[:, 1] + 1.0) * (y_high - y_low)
+        a[:, 2] = r_low + 0.5 * (a[:, 2] + 1.0) * (logic_r_high - r_low)
+        logic_forbid_elimination = bool(getattr(LogicBoxConfig, "FORBID_ELIMINATION", False))
+        logic_min_active_r = max(float(r_low), float(getattr(LogicBoxConfig, "MIN_ACTIVE_R", r_low)))
+        if logic_forbid_elimination:
+            a[:, 2] = np.maximum(a[:, 2], logic_min_active_r)
+        else:
+            logic_exist_th = float(
+                getattr(LogicBoxConfig, "EXIST_THRESHOLD", StokesCylinderConfig.EXIST_THRESHOLD)
+            )
+            a[:, 2] = np.where(a[:, 2] < logic_exist_th, 0.0, a[:, 2])
+        return a.reshape(-1).astype(np.float32)
+
+    def _decode_dynamic_radius_layout(self, radius_action: np.ndarray) -> np.ndarray:
+        r_low = float(getattr(LogicBoxConfig, "MIN_R", StokesCylinderConfig.MIN_R))
+        r_high = min(float(StokesCylinderConfig.MAX_R), float(get_logic_max_radius()))
+        raw = np.asarray(radius_action, dtype=np.float32).reshape(self.env.max_n)
+        radii = r_low + 0.5 * (raw + 1.0) * (r_high - r_low)
+        logic_forbid_elimination = bool(getattr(LogicBoxConfig, "FORBID_ELIMINATION", False))
+        logic_min_active_r = max(float(r_low), float(getattr(LogicBoxConfig, "MIN_ACTIVE_R", r_low)))
+        if logic_forbid_elimination:
+            radii = np.maximum(radii, logic_min_active_r)
+        else:
+            logic_exist_th = float(
+                getattr(LogicBoxConfig, "EXIST_THRESHOLD", StokesCylinderConfig.EXIST_THRESHOLD)
+            )
+            radii = np.where(radii < logic_exist_th, 0.0, radii)
+        return radii.astype(np.float32)
+
+    def _dynamic_logic_info(
+        self,
+        reward: float,
+        terminated: bool,
+        exit_rec=None,
+        collision: bool = False,
+        timeout: bool = False,
+        omega_delta: float = 0.0,
+        outlet_error: float = 1.0,
+        same_side: bool = False,
+        success: bool = False,
+    ):
+        src, tgt, tgt_side, tgt_xy = self._dynamic_target_info()
+        r = np.asarray(self.env.cylinders_r, dtype=np.float32)
+        total_count = int(r.size)
+        killed_eps = float(getattr(LogicBoxConfig, "KILLED_EPS", 1e-6))
+        inactive_count = int(np.sum(r <= killed_eps))
+        full_history = [
+            [float(px), float(py)]
+            for px, py in list(self.dynamic_episode_history)
+        ]
+        exits = []
+        if exit_rec is not None:
+            rec = dict(exit_rec)
+            rec.update(
+                {
+                    "seed": [float(full_history[0][0]), float(full_history[0][1])]
+                    if len(full_history) > 0
+                    else [0.0, 0.0],
+                    "exited": True,
+                    "collision": bool(collision),
+                    "history": full_history,
+                    "source_port": str(src),
+                    "target_port": str(tgt),
+                    "route": f"{src}->{tgt}",
+                }
+            )
+            exits.append(rec)
+
+        miss = 0.0 if (exit_rec is not None and not collision and not timeout) else 1.0
+        wrong = 0.0 if (exit_rec is not None and same_side) else (1.0 if exit_rec is not None else 0.0)
+        return {
+            "episode_return": float(reward),
+            "history_pos": full_history,
+            "target_path": self.ctx.path.tolist(),
+            "final_pos": self.ctx.particle_pos.tolist(),
+            "layout_x": self.env.cylinders_x.tolist(),
+            "layout_y": self.env.cylinders_y.tolist(),
+            "layout_r": self.env.cylinders_r.tolist(),
+            "layout_omega": np.full(self.env.max_n, self.env.fixed_omega, dtype=np.float32).tolist(),
+            "fixed_count": int(self.env.fixed_count),
+            "terminated_early": bool(terminated),
+            "layout_penalty": 0.0,
+            "overlap_penalty": 0.0,
+            "boundary_penalty": 0.0,
+            "sparse_penalty": 0.0,
+            "cluster_penalty": 0.0,
+            "active_count": int(np.sum(r > killed_eps)),
+            "inactive_count": int(inactive_count),
+            "total_count": int(total_count),
+            "zero_radius_ratio": float(inactive_count) / float(max(1, total_count)),
+            "killed_eps": float(killed_eps),
+            "empty_layout_penalty": 0.0,
+            "layout_mode": self.layout_mode,
+            "inflow_u": float(self.env.inflow_u),
+            "inflow_v": float(self.env.inflow_v),
+            "global_omega": float(self.env.fixed_omega),
+            "omega_delta": float(omega_delta),
+            "omega_trace": list(self.dynamic_omega_history),
+            "dynamic_omega_control": True,
+            "dynamic_step_count": int(self.dynamic_step_count),
+            "dynamic_timeout": bool(timeout),
+            "dynamic_success": bool(success),
+            "mean_path_dist": float(outlet_error),
+            "final_dist": float(outlet_error),
+            "path_coverage": 1.0 if success else 0.0,
+            "nearest_path_idx": len(self.ctx.path) - 1 if success else 0,
+            "target_to_traj_mean": float(outlet_error),
+            "traj_to_target_mean": float(outlet_error),
+            "path_block_penalty": 0.0,
+            "far_cylinder_penalty": 0.0,
+            "flow_tangent_penalty": 0.0,
+            "flow_normal_penalty": 0.0,
+            "inflow_reg_penalty": 0.0,
+            "gate_lane_error": 0.0,
+            "gate_lane_miss_ratio": 0.0,
+            "gate_lane_collision_ratio": 0.0,
+            "gate_lane_order_penalty": 0.0,
+            "gate_lane_y_cross": [],
+            "gate_lane_target_y": [],
+            "gate_dir_penalty": 0.0,
+            "gate_reverse_ratio": 0.0,
+            "logic_miss_ratio": float(miss),
+            "logic_collision_ratio": 1.0 if collision else 0.0,
+            "logic_wrong_side_ratio": float(wrong),
+            "logic_outlet_error": float(outlet_error),
+            "logic_forward_penalty": 0.0,
+            "logic_inlet_block_penalty": 0.0,
+            "logic_path_fit_error": 0.0,
+            "logic_path_cover_penalty": 0.0,
+            "logic_source_port": str(src),
+            "logic_target_port": str(tgt),
+            "logic_target_side": str(tgt_side),
+            "logic_target_xy": [float(tgt_xy[0]), float(tgt_xy[1])],
+            "logic_route_mode": str(getattr(LogicBoxConfig, "ROUTE_MODE", "single")),
+            "logic_route_pairs": [[str(src), str(tgt)]],
+            "logic_route_details": [],
+            "logic_exits": exits,
+            "logic_episode_source_port": str(src),
+            "logic_episode_target_port": str(tgt),
+            "logic_target_candidates": list(self.logic_target_candidates),
+            "logic_route_set_idx": int(self.logic_episode_route_set_idx),
+            "logic_route_set_total": int(len(self.logic_route_set_candidates)),
+            "logic_route_set_pairs": [[str(src), str(tgt)]],
+            "logic_route_mode_code": self._logic_route_set_mode_code().tolist(),
+            "logic_reward_mode": "dynamic_omega",
+        }
+
+    def _step_dynamic_omega(self, action: np.ndarray):
+        a = np.asarray(action, dtype=np.float32).reshape(-1)
+        if self.dynamic_omega_design_layout:
+            layout_dim = int(self.env.max_n if self.dynamic_omega_radius_design_layout else self.env.max_n * 3)
+            if a.size < layout_dim + 1:
+                raise ValueError(
+                    f"Dynamic omega design action expects {layout_dim + 1} dims, got {a.size}"
+                )
+            if self.dynamic_step_count == 0:
+                if self.dynamic_omega_radius_design_layout:
+                    radius_vec = self._decode_dynamic_radius_layout(a[:layout_dim])
+                    self.env.apply_geometry_only(radius_vec)
+                else:
+                    layout_vec = self._decode_dynamic_geometry_layout(a[:layout_dim])
+                    self.env.apply_geometry_only(layout_vec)
+            raw = float(np.clip(a[layout_dim], -1.0, 1.0))
+        else:
+            raw = float(np.clip(a[0] if a.size > 0 else 0.0, -1.0, 1.0))
+        max_delta = abs(float(getattr(DynamicOmegaControlConfig, "MAX_DELTA_OMEGA", 0.25)))
+        omega_prev = float(self.env.fixed_omega)
+        omega_delta = raw * max_delta
+        omega_next = float(
+            np.clip(
+                omega_prev + omega_delta,
+                float(getattr(GlobalOmegaControlConfig, "OMEGA_MIN", -np.inf)),
+                float(getattr(GlobalOmegaControlConfig, "OMEGA_MAX", np.inf)),
+            )
+        )
+        self.env.fixed_omega = omega_next
+        self.dynamic_omega_history.append(float(omega_next))
+
+        src, tgt, tgt_side, tgt_xy = self._dynamic_target_info()
+        diag = max(
+            np.hypot(
+                RenderSettingConfig.X_LIM[1] - RenderSettingConfig.X_LIM[0],
+                RenderSettingConfig.Y_LIM[1] - RenderSettingConfig.Y_LIM[0],
+            ),
+            1e-8,
+        )
+        prev_pos = np.asarray(self.ctx.particle_pos, dtype=np.float32).copy()
+        prev_dist = float(np.linalg.norm(prev_pos - tgt_xy))
+
+        _, physical_done, extra = self.env.step(action=None)
+        step_history = [
+            (float(px), float(py))
+            for px, py in extra.get("history_pos", [])
+        ]
+        exit_rec = None
+        p0 = prev_pos.copy()
+        for hp in step_history:
+            p1 = np.asarray(hp, dtype=np.float32)
+            maybe_exit = _logic_box_segment_exit(p0, p1)
+            if bool(maybe_exit.get("exited", False)):
+                exit_rec = maybe_exit
+                if maybe_exit["side"] == "right":
+                    p1 = np.array([logic_box_bounds()[0][1], maybe_exit["coord"]], dtype=np.float32)
+                elif maybe_exit["side"] == "left":
+                    p1 = np.array([logic_box_bounds()[0][0], maybe_exit["coord"]], dtype=np.float32)
+                elif maybe_exit["side"] == "top":
+                    p1 = np.array([maybe_exit["coord"], logic_box_bounds()[1][1]], dtype=np.float32)
+                else:
+                    p1 = np.array([maybe_exit["coord"], logic_box_bounds()[1][0]], dtype=np.float32)
+                self.dynamic_episode_history.append((float(p1[0]), float(p1[1])))
+                break
+            self.dynamic_episode_history.append((float(p1[0]), float(p1[1])))
+            p0 = p1
+
+        if exit_rec is None and len(step_history) == 0:
+            cur_tmp = np.array([self.env.particle.pos_x, self.env.particle.pos_y], dtype=np.float32)
+            self.dynamic_episode_history.append((float(cur_tmp[0]), float(cur_tmp[1])))
+
+        if exit_rec is not None:
+            side = str(exit_rec["side"])
+            coord = float(exit_rec["coord"])
+            if side == "right":
+                cur_pos = np.array([logic_box_bounds()[0][1], coord], dtype=np.float32)
+            elif side == "left":
+                cur_pos = np.array([logic_box_bounds()[0][0], coord], dtype=np.float32)
+            elif side == "top":
+                cur_pos = np.array([coord, logic_box_bounds()[1][1]], dtype=np.float32)
+            else:
+                cur_pos = np.array([coord, logic_box_bounds()[1][0]], dtype=np.float32)
+            self.env.particle.pos_x = float(cur_pos[0])
+            self.env.particle.pos_y = float(cur_pos[1])
+        else:
+            cur_pos = np.array([self.env.particle.pos_x, self.env.particle.pos_y], dtype=np.float32)
+
+        self.ctx.particle_pos = cur_pos.copy()
+        self.ctx.current_step = min(self.ctx.current_step + 1, len(self.ctx.path) - 1)
+        self.dynamic_step_count += 1
+
+        centers = np.stack([self.env.cylinders_x, self.env.cylinders_y], axis=1)
+        if centers.size > 0:
+            d2 = np.sum((centers - cur_pos[None, :]) ** 2, axis=1)
+            collision = bool(np.any(d2 < (self.env.cylinders_r ** 2)))
+        else:
+            collision = False
+
+        max_steps = max(1, int(getattr(DynamicOmegaControlConfig, "MAX_STEPS", 160)))
+        timeout = bool(self.dynamic_step_count >= max_steps and exit_rec is None and not collision)
+        terminated = bool(exit_rec is not None or collision or timeout or (physical_done and exit_rec is None))
+
+        cur_dist = float(np.linalg.norm(cur_pos - tgt_xy))
+        progress = (prev_dist - cur_dist) / float(diag)
+        reward = float(getattr(DynamicOmegaControlConfig, "W_PROGRESS", 12.0)) * float(progress)
+        reward -= float(getattr(DynamicOmegaControlConfig, "W_STEP", 0.02))
+        reward -= float(getattr(DynamicOmegaControlConfig, "W_DOMEGA", 0.05)) * float(raw * raw)
+        omega_scale = max(
+            abs(float(getattr(GlobalOmegaControlConfig, "OMEGA_MIN", -1.0))),
+            abs(float(getattr(GlobalOmegaControlConfig, "OMEGA_MAX", 1.0))),
+            1e-8,
+        )
+        reward -= float(getattr(DynamicOmegaControlConfig, "W_OMEGA", 0.0)) * float(
+            (omega_next / omega_scale) ** 2
+        )
+
+        outlet_error = 1.0
+        same_side = False
+        success = False
+        if collision:
+            reward -= float(getattr(LogicBoxConfig, "W_COLLISION", 110.0))
+        elif exit_rec is not None:
+            outlet_error, same_side = _logic_exit_match_error(
+                side=str(exit_rec["side"]),
+                coord=float(exit_rec["coord"]),
+                target_side=str(tgt_side),
+                target_xy=tgt_xy,
+            )
+            reward -= float(getattr(LogicBoxConfig, "W_OUTLET_POS", 60.0)) * float(outlet_error)
+            if same_side:
+                success = bool(
+                    outlet_error <= float(getattr(DynamicOmegaControlConfig, "SUCCESS_OUTLET_ERROR", 0.60))
+                )
+                reward += float(getattr(DynamicOmegaControlConfig, "SUCCESS_BONUS", 160.0))
+            else:
+                reward -= float(getattr(LogicBoxConfig, "W_WRONG_SIDE", 120.0))
+        elif timeout or (physical_done and exit_rec is None):
+            timeout_error_clip = float(
+                getattr(DynamicOmegaControlConfig, "TIMEOUT_OUTLET_ERROR_CLIP", 12.0)
+            )
+            outlet_error = min(
+                max(timeout_error_clip, 2.0),
+                cur_dist / max(float(getattr(LogicBoxConfig, "OUTLET_SIGMA", 0.02)), 1e-8),
+            )
+            reward -= float(getattr(LogicBoxConfig, "W_MISS", 130.0))
+            reward -= float(getattr(DynamicOmegaControlConfig, "TIMEOUT_DIST_WEIGHT", 30.0)) * float(outlet_error)
+
+        self.episode_return += float(reward)
+        self.last_history = list(self.dynamic_episode_history)
+        obs = self._get_obs()
+        info = self._dynamic_logic_info(
+            reward=float(self.episode_return),
+            terminated=terminated,
+            exit_rec=exit_rec,
+            collision=collision,
+            timeout=timeout,
+            omega_delta=omega_delta,
+            outlet_error=outlet_error,
+            same_side=same_side,
+            success=success,
+        )
+        return obs, float(reward), terminated, False, info
+
     def step(self, action: np.ndarray):
+        if self.dynamic_omega_control:
+            return self._step_dynamic_omega(action)
+
         # One-shot static optimization: reward is computed directly from
         # layout-induced flow quality w.r.t. target trajectory.
         physical_action = self._decode_action(action)

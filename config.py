@@ -12,11 +12,15 @@ class LayoutModeConfig:
     # "gate3_layout_inflow_u_fixed": gate3 layout + horizontal inflow fixed
     # "logic_box_layout_inflow": rectangular black-box routing with configurable ports
     # "logic_box_layout_inflow_u_fixed": logic-box routing + horizontal inflow fixed
-    LAYOUT_MODE = "logic_box_layout_inflow_u_fixed"
+    # "logic_box_layout_inflow_u_fixed_omega_rt": fixed geometry + real-time delta-omega control
+    # "logic_box_layout_inflow_u_fixed_omega_rt_design": learn one episode-locked x/y/r layout + real-time omega
+    # "logic_box_layout_inflow_u_fixed_omega_rt_radius_design": fixed centers + learn radii + real-time omega
+    LAYOUT_MODE = "logic_box_layout_inflow_u_fixed_omega_rt_radius_design"
 
 
 class StokesCylinderConfig:
-    FIXED_OMEGA = 1.256
+    # 1 Hz = 2*pi rad/s. Used as the default/reference angular speed.
+    FIXED_OMEGA = 2.0 * np.pi
     NUM_CYLINDERS = 9
 
     X_RANGE = (-0.15, 0.15)
@@ -36,8 +40,34 @@ class GlobalOmegaControlConfig:
     # "continuous": omega is optimized in [OMEGA_MIN, OMEGA_MAX].
     MODE = "continuous"
 
-    OMEGA_MIN = -1.256
-    OMEGA_MAX = 1.256
+    # Max rotation frequency is 1 Hz, with reversible direction.
+    OMEGA_MIN = -2.0 * np.pi
+    OMEGA_MAX = 2.0 * np.pi
+
+
+class DynamicOmegaControlConfig:
+    # Real-time omega control for fixed-geometry logic-box routing.
+    # Action is interpreted as a bounded delta-omega command:
+    #   omega[t+1] = clip(omega[t] + action * MAX_DELTA_OMEGA, OMEGA_MIN, OMEGA_MAX)
+    START_OMEGA = 0.0
+    MAX_DELTA_OMEGA = 0.25
+
+    # Episode length in policy steps. Each step internally advances FluidEnv by ACTION_DT.
+    MAX_STEPS = 260
+
+    # Dense shaping and terminal rewards for dynamic outlet routing.
+    SUCCESS_BONUS = 160.0
+    W_PROGRESS = 12.0
+    W_STEP = 0.02
+    W_DOMEGA = 0.05
+    W_OMEGA = 0.00
+    TIMEOUT_DIST_WEIGHT = 30.0
+    # When the particle never exits the box, keep enough target-distance signal
+    # to distinguish R0/R1/R2 instead of collapsing all misses to the same loss.
+    TIMEOUT_OUTLET_ERROR_CLIP = 12.0
+
+    # Outlet tolerance only affects diagnostics/success flag; reward still uses OUTLET_SIGMA error.
+    SUCCESS_OUTLET_ERROR = 0.60
 
 
 class FixedGrid3x3Config:
@@ -289,10 +319,14 @@ class LogicBoxConfig:
     # MAX_R_AUTO_SCALE_TO_BOUNDS=True, it scales with logic bounds size.
     MAX_R = 0.020
     MAX_R_AUTO_SCALE_TO_BOUNDS = False
+    # Continuous lower radius bound for logic-box design. Set to 0 so cylinders
+    # can be smoothly weakened instead of being threshold-eliminated.
+    MIN_R = 0.0
     EXIST_THRESHOLD = 0.0
     # Hard floor on active radius in logic-box mode (when FORBID_ELIMINATION=True).
-    MIN_ACTIVE_R = 0.0005
-    # If True, logic-box radii are clamped to at least MIN_ACTIVE_R (no r=0 elimination).
+    MIN_ACTIVE_R = 0.0
+    # If True, logic-box radii are clamped to at least MIN_ACTIVE_R.
+    # With MIN_ACTIVE_R=0, this keeps the mapping continuous down to r=0.
     FORBID_ELIMINATION = True
     # Radius <= KILLED_EPS is counted as "eliminated" in diagnostics.
     KILLED_EPS = 1e-6
@@ -387,12 +421,65 @@ class TrainingSettingConfig:
     # - omega/inflow tail is optimized by a target-aware actor branch
     # This is for "learn one fixed geometry, switch outlets by omega only".
     SHARED_GEOMETRY_ONE_STAGE_ENABLE = True
+    # Two-timescale structure-control policy:
+    # - x/y/r are global trainable structure parameters (slow hardware design)
+    # - omega(t) is a target-aware feedback controller (fast control input)
+    # Recommended for *_omega_rt_design modes.
+    STRUCTURE_CONTROL_POLICY_ENABLE = True
 
 
 class RankineSettingConfig:
     # Backward-compatible fields for legacy scripts.
     R = float(StokesCylinderConfig.MAX_R)
     RANKINES_POS = np.array([[0.0, 0.0]], dtype=np.float32)
+
+
+def strip_dynamic_omega_suffix(layout_mode: str):
+    mode = str(layout_mode)
+    for suffix in (
+        "_omega_rt_radius_design",
+        "_dynamic_omega_radius_design",
+        "_rtomega_radius_design",
+        "_omega_rt_design",
+        "_dynamic_omega_design",
+        "_rtomega_design",
+        "_omega_rt",
+        "_dynamic_omega",
+        "_rtomega",
+    ):
+        if mode.endswith(suffix):
+            return mode[: -len(suffix)], True
+    return mode, False
+
+
+def is_dynamic_omega_mode(layout_mode: str) -> bool:
+    _, enabled = strip_dynamic_omega_suffix(layout_mode)
+    return bool(enabled)
+
+
+def is_dynamic_omega_design_mode(layout_mode: str) -> bool:
+    mode = str(layout_mode)
+    return mode.endswith(
+        (
+            "_omega_rt_design",
+            "_dynamic_omega_design",
+            "_rtomega_design",
+            "_omega_rt_radius_design",
+            "_dynamic_omega_radius_design",
+            "_rtomega_radius_design",
+        )
+    )
+
+
+def is_dynamic_omega_radius_design_mode(layout_mode: str) -> bool:
+    mode = str(layout_mode)
+    return mode.endswith(
+        (
+            "_omega_rt_radius_design",
+            "_dynamic_omega_radius_design",
+            "_rtomega_radius_design",
+        )
+    )
 
 
 def get_logic_box_ranges():

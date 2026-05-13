@@ -46,7 +46,7 @@ python train.py --layout-mode logic_box_layout_inflow_u_fixed --path-type logic_
 - 实际目标集合由 `--target-port-set` 决定。
 - 目标采样默认建议用 `LogicBoxConfig.TARGET_SAMPLE_MODE = "cycle"`，保证 `T0/R0/B0` 轮流训练，不会长期偏向某两个口。
 
-### 4.1 固定几何、只调全局转速（omega-only）
+### 4.1 固定几何、只调全局转速（one-shot omega-only）
 
 目标：
 - 圆柱 `x/y/r` 在一局中完全固定；
@@ -74,6 +74,188 @@ python train.py --layout-mode logic_box_layout_inflow_u_fixed --path-type logic_
 python test.py --layout-mode logic_box_layout_inflow_u_fixed --model models\best\<your_tag>\best_model.zip --vecnorm models\best\<your_tag>\vecnormalize_best.pkl --logic-target-port R0
 python test.py --layout-mode logic_box_layout_inflow_u_fixed --model models\best\<your_tag>\best_model.zip --vecnorm models\best\<your_tag>\vecnormalize_best.pkl --logic-target-port R1
 python test.py --layout-mode logic_box_layout_inflow_u_fixed --model models\best\<your_tag>\best_model.zip --vecnorm models\best\<your_tag>\vecnormalize_best.pkl --logic-target-port R2
+```
+
+### 4.2 固定几何、实时连续调转速（dynamic omega）
+
+目标：
+- 圆柱 `x/y/r` 固定；
+- 水平来流固定；
+- 策略每个时间步只输出一个 `delta_omega`；
+- 环境真实推进粒子，直到粒子出边界、碰撞或超时；
+- 用目标出口是否命中作为主要奖励。
+
+这个模式更接近磁性旋转油滴实验：转速可以实时改变，但变化率受限，不是瞬间跳到任意值。
+
+关键配置（`config.py`）：
+- `LayoutModeConfig.LAYOUT_MODE = "logic_box_layout_inflow_u_fixed_omega_rt"`
+- `LogicBoxConfig.ROUTE_MODE = "single_multi_target"`
+- `LogicBoxConfig.FIXED_LAYOUT_ENABLE = True`
+- `LogicBoxConfig.FIXED_GEOMETRY_ENABLE = True`
+- `LogicBoxConfig.FIXED_LAYOUT_X/Y/R` 定义固定圆柱位置和半径
+- `GlobalOmegaControlConfig.OPTIMIZE_OMEGA = True`
+- `GlobalOmegaControlConfig.OMEGA_MIN / OMEGA_MAX` 控制允许转速范围
+- `DynamicOmegaControlConfig.MAX_DELTA_OMEGA` 控制每步最大转速变化
+- `DynamicOmegaControlConfig.MAX_STEPS` 控制一局最多控制步数
+
+当前默认最大转速设为 `1 Hz`：
+
+```python
+GlobalOmegaControlConfig.OMEGA_MIN = -2.0 * np.pi
+GlobalOmegaControlConfig.OMEGA_MAX = 2.0 * np.pi
+```
+
+训练示例：
+
+```powershell
+python train.py --layout-mode logic_box_layout_inflow_u_fixed_omega_rt --path-type logic_route --logic-route-mode single_multi_target --source-port L1 --target-port R0 --target-port-set R0,R1,R2 --total-timesteps 500000 --eval-freq 20000 --workers 1 --run-alias omega_rt_fixed_geom
+```
+
+测试某个目标出口：
+
+```powershell
+python test.py --layout-mode logic_box_layout_inflow_u_fixed_omega_rt --model models\best\<your_tag>\best_model.zip --vecnorm models\best\<your_tag>\vecnormalize_best.pkl --logic-target-port R0 --rollout-steps 160
+python test.py --layout-mode logic_box_layout_inflow_u_fixed_omega_rt --model models\best\<your_tag>\best_model.zip --vecnorm models\best\<your_tag>\vecnormalize_best.pkl --logic-target-port R1 --rollout-steps 160
+python test.py --layout-mode logic_box_layout_inflow_u_fixed_omega_rt --model models\best\<your_tag>\best_model.zip --vecnorm models\best\<your_tag>\vecnormalize_best.pkl --logic-target-port R2 --rollout-steps 160
+```
+
+### 4.2.1 搜索通用布局、局内锁定布局、实时调转速
+
+如果目标是“训练出一套通用 `x/y/r` 布局，并在每一局内部锁定它，只靠实时 `omega(t)` 把同一入口送到不同出口”，用：
+
+```text
+logic_box_layout_inflow_u_fixed_omega_rt_design
+```
+
+这个模式默认使用 `structure-control policy`，把结构和控制拆成两个时间尺度：
+
+```text
+慢变量结构：x/y/r 是一组全局可学习参数，不看目标出口，也不随粒子状态变化
+快变量控制：每一步根据粒子状态、目标出口、当前 omega 输出 delta_omega
+环境执行：每局开始锁定当前 x/y/r，局内只更新 omega(t)
+训练过程中：PPO 仍会更新全局 x/y/r，因此能继续探索更好的通用布局
+```
+
+这比旧的 shared-geometry policy 更硬：旧策略虽然屏蔽目标，但几何 head 仍会随状态输出；
+新策略直接把 `x/y/r` 变成目标无关的全局结构参数，更符合“同一个物理装置，只改变转速控制”的实验设定。
+
+训练命令：
+
+```powershell
+python train.py `
+  --layout-mode logic_box_layout_inflow_u_fixed_omega_rt_design `
+  --path-type logic_route `
+  --logic-route-mode single_multi_target `
+  --source-port L1 `
+  --target-port R0 `
+  --target-port-set R0,R1,R2 `
+  --num-cylinders 9 `
+  --total-timesteps 1000000 `
+  --eval-freq 20000 `
+  --workers 1 `
+  --run-alias omega_rt_design_L1_R012
+```
+
+如果需要退回旧 shared-geometry 策略，可加：
+
+```powershell
+--no-structure-control-policy
+```
+
+测试：
+
+```powershell
+python test.py --layout-mode logic_box_layout_inflow_u_fixed_omega_rt_design --model models\best\<your_tag>\best_model.zip --vecnorm models\best\<your_tag>\vecnormalize_best.pkl --logic-target-port R0 --rollout-steps 260
+python test.py --layout-mode logic_box_layout_inflow_u_fixed_omega_rt_design --model models\best\<your_tag>\best_model.zip --vecnorm models\best\<your_tag>\vecnormalize_best.pkl --logic-target-port R1 --rollout-steps 260
+python test.py --layout-mode logic_box_layout_inflow_u_fixed_omega_rt_design --model models\best\<your_tag>\best_model.zip --vecnorm models\best\<your_tag>\vecnormalize_best.pkl --logic-target-port R2 --rollout-steps 260
+```
+
+### 4.2.2 固定位置、只训练半径、实时调转速
+
+如果先降低维度，让 9 个转子位置固定为 `LogicBoxConfig.FIXED_LAYOUT_X/Y`，只训练每个圆柱半径 `r_i`，并在局内实时控制统一 `omega(t)`，用：
+
+```text
+logic_box_layout_inflow_u_fixed_omega_rt_radius_design
+```
+
+这个模式的动作维度是：
+
+```text
+N 个半径动作 + 1 个 delta_omega
+```
+
+例如 `N=9` 时，动作维度从自由布局模式的 `28 = 9*3 + 1` 降到：
+
+```text
+10 = 9 + 1
+```
+
+训练命令：
+
+```powershell
+python train.py `
+  --layout-mode logic_box_layout_inflow_u_fixed_omega_rt_radius_design `
+  --path-type logic_route `
+  --logic-route-mode single_multi_target `
+  --source-port L1 `
+  --target-port-set R0,R1,R2 `
+  --num-cylinders 9 `
+  --total-timesteps 1000000 `
+  --eval-freq 20000 `
+  --workers 1 `
+  --run-alias radius_rt_L1_R012
+```
+
+测试：
+
+```powershell
+python test.py --layout-mode logic_box_layout_inflow_u_fixed_omega_rt_radius_design --model models\best\<your_tag>\best_model.zip --vecnorm models\best\<your_tag>\vecnormalize_best.pkl --logic-target-port R0 --rollout-steps 260
+python test.py --layout-mode logic_box_layout_inflow_u_fixed_omega_rt_radius_design --model models\best\<your_tag>\best_model.zip --vecnorm models\best\<your_tag>\vecnormalize_best.pkl --logic-target-port R1 --rollout-steps 260
+python test.py --layout-mode logic_box_layout_inflow_u_fixed_omega_rt_radius_design --model models\best\<your_tag>\best_model.zip --vecnorm models\best\<your_tag>\vecnormalize_best.pkl --logic-target-port R2 --rollout-steps 260
+```
+
+### 4.3 先找布局，再锁定布局训练实时转速
+
+如果你还没有固定几何，使用这个两阶段脚本：
+
+```text
+A阶段：自由搜索同一套 x/y/r 布局
+B阶段：锁定 A 阶段 best 的 x/y/r，只训练实时 omega(t)
+```
+
+命令：
+
+```powershell
+python train_find_layout_then_dynamic_omega.py `
+  --source-port L1 `
+  --targets R0,R1,R2 `
+  --num-cylinders 9 `
+  --stage-a-steps 600000 `
+  --stage-b-steps 800000 `
+  --eval-freq 20000 `
+  --workers 1 `
+  --run-prefix L1_R012_find_then_rt
+```
+
+输出：
+- A 阶段模型：`models/best/*_A_find_geom/`
+- B 阶段模型：`models/best/*_B_omega_rt/`
+- 中间固定几何：`models/best/<run-prefix>_find_geom_then_omega_rt_bundle/fixed_geometry_from_stage_a.npz`
+- 最终模型副本：`models/best/<run-prefix>_find_geom_then_omega_rt_bundle/final_dynamic_omega/`
+
+如果 A 阶段已经训练过，只想从已有 A 模型继续做 B 阶段：
+
+```powershell
+python train_find_layout_then_dynamic_omega.py `
+  --source-port L1 `
+  --targets R0,R1,R2 `
+  --skip-stage-a `
+  --stage-a-model models\best\<stage_a_tag>\best_model.zip `
+  --stage-a-vecnorm models\best\<stage_a_tag>\vecnormalize_best.pkl `
+  --stage-b-steps 800000 `
+  --eval-freq 20000 `
+  --workers 1 `
+  --run-prefix L1_R012_find_then_rt
 ```
 
 ## 5. 扫描圆柱数量 N 和最小半径 r_min（推荐）
@@ -299,3 +481,60 @@ python batch_ab_multiswitch.py `
 - `--stage-cycles` / `--stage-lrs` 顺序固定为 `[A0,B0,A1,B1]`。
 - 任一阶段填 `0` 可跳过该阶段（例如只跑 `A0,B0`）。
 - `--run-tests` 会在最终模型上按 route-set index 逐个调用 `test.py`，GIF 也归档到同一 bundle 目录。
+
+## 14. 实验参数导出（圆柱位置/直径/转速/来流）
+
+脚本：`export_experiment_layout.py`
+
+作用：
+- 从 `best_model.zip` 解码当前最优布局；
+- 输出每个圆柱的位置、半径、直径；
+- 输出全局转速 `omega` 的 `rad/s`、`Hz`、`rpm`；
+- 输出来流大小，以及来流相对圆柱表面转速的无量纲比值；
+- 默认把 logic box 的高度映射为实验平台宽度。
+
+示例：实验平台宽度 `1.4 cm`，并行三粒子模式 `multi_map`：
+
+```powershell
+python export_experiment_layout.py `
+  --layout-mode logic_box_layout_inflow_u_fixed `
+  --logic-route-mode multi_map `
+  --num-cylinders 6 `
+  --run-alias <your_run_alias> `
+  --platform-width-cm 1.4
+```
+
+如果是可重构并行模式 `multi_map_switch`，指定某个 route-set：
+
+```powershell
+python export_experiment_layout.py `
+  --layout-mode logic_box_layout_inflow_u_fixed `
+  --logic-route-mode multi_map_switch `
+  --logic-route-set-idx 0 `
+  --num-cylinders 6 `
+  --run-alias <your_run_alias> `
+  --platform-width-cm 1.4
+```
+
+指定模型路径：
+
+```powershell
+python export_experiment_layout.py `
+  --model models\best\<task_tag>\best_model.zip `
+  --vecnorm models\best\<task_tag>\vecnormalize_best.pkl `
+  --layout-mode logic_box_layout_inflow_u_fixed `
+  --logic-route-mode multi_map `
+  --num-cylinders 6 `
+  --platform-width-cm 1.4
+```
+
+输出文件：
+- `experiment_layout.csv`：实验简表，一行一个圆柱，只保留 `idx`、左下角原点位置 `x/y(mm)`、直径 `diameter_mm`。
+- `experiment_layout_controls.csv`：全局控制量，只写一行，包括 `omega`、来流、来流/圆柱表面速度比、缩放比例。
+- `experiment_layout.json`：完整数据，包含仿真坐标、居中坐标、半径、直径、route 信息和元数据。
+
+默认位置：和 `best_model.zip` 在同一个文件夹。
+
+换算说明：
+- 默认 `--scale-ref logic_box_y`，即 `LogicBoxConfig.BOX_Y_RANGE` 的高度对应实验平台宽度 `1.4 cm`。
+- 如果要用整张绘图区高度对应 `1.4 cm`，加 `--scale-ref render_y`。

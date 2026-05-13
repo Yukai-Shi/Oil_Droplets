@@ -1,0 +1,2 @@
+omega_rad_s,omega_hz,omega_rpm,omega_direction,inflow_u_sim,inflow_v_sim,inflow_speed_sim,inflow_speed_mm_s_if_sim_s,mean_inflow_to_surface_speed,scale_mm_per_sim,platform_width_mm,logic_box_width_x_mm,logic_box_width_y_mm
+1.256,0.19989860852342056,11.993916511405233,1,0.002,0.0,0.002,0.09999999999999998,1.1631640794325668,49.99999999999999,14.0,15.999999999999996,14.0

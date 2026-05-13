@@ -1,4 +1,5 @@
 import argparse
+import csv
 import os
 import platform
 from pathlib import Path
@@ -13,11 +14,16 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from config import (
+    DynamicOmegaControlConfig,
     LayoutModeConfig,
     LogicBoxConfig,
     TrainingSettingConfig,
     get_logic_multi_route_pairs,
     get_logic_multi_route_sets,
+    is_dynamic_omega_design_mode,
+    is_dynamic_omega_mode,
+    is_dynamic_omega_radius_design_mode,
+    strip_dynamic_omega_suffix,
 )
 from envs.FluidEnv import FluidEnv
 from envs.Renderer import FluidRenderer
@@ -32,7 +38,7 @@ if platform.system() == "Darwin" and torch.backends.mps.is_available():
 
 
 def parse_layout_mode(layout_mode: str):
-    mode = str(layout_mode)
+    mode, _ = strip_dynamic_omega_suffix(str(layout_mode))
     if mode.endswith("_inflow_u_fixed"):
         return mode[:-15], True
     # Backward-compatible alias: *_inflow_u == *_inflow_u_fixed
@@ -212,7 +218,10 @@ def run_long_rollout(
                 if isinstance(logic_box, dict):
                     logic_box["seed_points"] = []
                     logic_box["seed_streamlines"] = []
-            title = f"Long Rollout | t={t + 1}/{rollout_steps}"
+            title = (
+                f"t:{t + 1}/{rollout_steps} | "
+                f"f:{(float(fe.fixed_omega) / (2.0 * np.pi)):.2f} Hz"
+            )
             frame = renderer.render(
                 scene=scene,
                 follower_path=path_history,
@@ -233,7 +242,7 @@ def run_long_rollout(
             follower_path=path_history,
             target_pos=ctx.goal if show_target_point else None,
             target_path=target_path if show_target_path else None,
-            title="Long Rollout",
+            title=f"f:{(float(fe.fixed_omega) / (2.0 * np.pi)):.2f} Hz",
             draw_flow=True,
         )
         frames.append(frame)
@@ -260,6 +269,226 @@ def run_long_rollout(
         f"done_early={done_early}, final_pos=({ctx.particle_pos[0]:.4f}, {ctx.particle_pos[1]:.4f}), "
         f"omega={fe.fixed_omega:.4f}, inflow=({fe.inflow_u:.4f},{fe.inflow_v:.4f}), "
         f"dead={inactive_count}/{total_count}, killed_eps={killed_eps:.1e}"
+    )
+
+
+def _save_omega_trace_plot(records, output_png: Path):
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"[Warn] omega trace plot skipped: {exc}")
+        return
+
+    steps = np.asarray([r["step"] for r in records], dtype=np.float32)
+    freq = np.asarray([r["frequency_hz"] for r in records], dtype=np.float32)
+    raw = np.asarray([r["raw_delta_action"] for r in records], dtype=np.float32)
+
+    fig, ax1 = plt.subplots(figsize=(7.0, 3.0), dpi=160)
+    ax1.plot(steps, freq, color="#1261a0", linewidth=2.0, label="frequency")
+    ax1.set_xlabel("control step")
+    ax1.set_ylabel("frequency (Hz)", color="#1261a0")
+    ax1.tick_params(axis="y", labelcolor="#1261a0")
+    ax1.grid(True, alpha=0.25)
+
+    ax2 = ax1.twinx()
+    ax2.plot(steps, raw, color="#d9822b", linewidth=1.2, alpha=0.75, label="raw delta action")
+    ax2.set_ylabel("raw delta action", color="#d9822b")
+    ax2.tick_params(axis="y", labelcolor="#d9822b")
+    ax2.set_ylim(-1.05, 1.05)
+
+    target = records[-1].get("target_port", "")
+    fig.suptitle(f"Omega Control Trace | target:{target}", fontsize=10)
+    fig.tight_layout()
+    output_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_png)
+    plt.close(fig)
+
+
+def run_dynamic_omega_rollout(
+    model_path: str,
+    vecnorm_path: str,
+    layout_mode: str,
+    rollout_steps: int,
+    frame_stride: int,
+    fps: int,
+    output_gif: str,
+    show_target_point: bool,
+    show_target_path: bool,
+    hide_logic_seeds: bool,
+    logic_target_port: Optional[str] = None,
+    logic_route_set_idx: Optional[int] = None,
+):
+    ctx = TaskContext()
+    fe = FluidEnv(
+        start_pos=np.array([-0.025, 0.06], dtype=np.float32),
+        layout_mode=layout_mode,
+    )
+    env = FollowerEnv(fluid_env=fe, ctx=ctx, logic_seed_profile="eval")
+    if logic_target_port is not None and hasattr(env, "set_logic_forced_target_port"):
+        env.set_logic_forced_target_port(str(logic_target_port).upper())
+    if logic_route_set_idx is not None and hasattr(env, "set_logic_forced_route_set_idx"):
+        env.set_logic_forced_route_set_idx(int(logic_route_set_idx))
+
+    vec_env = DummyVecEnv([lambda: env])
+    if vecnorm_path and os.path.isfile(vecnorm_path):
+        vec_env = VecNormalize.load(vecnorm_path, vec_env)
+        vec_env.training = False
+        vec_env.norm_reward = False
+    model = PPO.load(model_path, env=vec_env, device=DEVICE)
+    renderer = FluidRenderer()
+
+    obs = vec_env.reset()
+    path_history = [tuple(ctx.particle_pos.tolist())]
+    target_path = ctx.path.tolist()
+    frames = []
+    total_reward = 0.0
+    done_early = False
+    last_info = {}
+    omega_records = []
+    max_steps = min(
+        int(max(1, rollout_steps)),
+        max(1, int(getattr(DynamicOmegaControlConfig, "MAX_STEPS", rollout_steps))),
+    )
+
+    for t in range(max_steps):
+        action, _ = model.predict(obs, deterministic=True)
+        action_flat = np.asarray(action, dtype=np.float32).reshape(-1)
+        raw_delta_action = float(action_flat[-1]) if action_flat.size > 0 else 0.0
+        obs, reward, done, info = vec_env.step(action)
+        step_reward = float(reward[0]) if isinstance(reward, (list, tuple, np.ndarray)) else float(reward)
+        total_reward += step_reward
+        last_info = info[0] if isinstance(info, (list, tuple)) else info
+
+        hist = last_info.get("history_pos", [])
+        if len(hist) > 0:
+            path_history = [(float(px), float(py)) for px, py in hist]
+        ctx.particle_pos = np.array(last_info.get("final_pos", ctx.particle_pos), dtype=np.float32)
+        omega_now = float(last_info.get("global_omega", fe.fixed_omega))
+        omega_records.append(
+            {
+                "step": int(t + 1),
+                "omega_rad_s": omega_now,
+                "frequency_hz": omega_now / (2.0 * np.pi),
+                "raw_delta_action": raw_delta_action,
+                "omega_delta_rad_s": float(last_info.get("omega_delta", np.nan)),
+                "x": float(ctx.particle_pos[0]),
+                "y": float(ctx.particle_pos[1]),
+                "step_reward": step_reward,
+                "total_reward": float(total_reward),
+                "target_port": str(last_info.get("logic_target_port", logic_target_port)),
+            }
+        )
+
+        done0 = bool(done[0]) if isinstance(done, (list, tuple, np.ndarray)) else bool(done)
+        if t % max(1, frame_stride) == 0 or t == max_steps - 1 or done0:
+            scene = env.get_scene()
+            if done0 and isinstance(last_info, dict):
+                scene["particle"] = {
+                    "x": float(ctx.particle_pos[0]),
+                    "y": float(ctx.particle_pos[1]),
+                }
+                scene["target"] = {
+                    "x": float(target_path[-1][0]),
+                    "y": float(target_path[-1][1]),
+                }
+                om = float(last_info.get("global_omega", fe.fixed_omega))
+                scene["cylinders"] = {
+                    "x": list(last_info.get("layout_x", fe.cylinders_x.tolist())),
+                    "y": list(last_info.get("layout_y", fe.cylinders_y.tolist())),
+                    "r": list(last_info.get("layout_r", fe.cylinders_r.tolist())),
+                    "omegas": list(
+                        last_info.get(
+                            "layout_omega",
+                            np.full(fe.max_n, om, dtype=np.float32).tolist(),
+                        )
+                    ),
+                    "fixed_count": int(last_info.get("fixed_count", fe.fixed_count)),
+                }
+                scene["inflow"] = {
+                    "u": float(last_info.get("inflow_u", fe.inflow_u)),
+                    "v": float(last_info.get("inflow_v", fe.inflow_v)),
+                }
+                scene["global_omega"] = om
+                logic_box = scene.get("logic_box", None)
+                if isinstance(logic_box, dict):
+                    logic_box["source_port"] = str(last_info.get("logic_source_port", logic_box.get("source_port", "")))
+                    logic_box["target_port"] = str(last_info.get("logic_target_port", logic_box.get("target_port", "")))
+                    logic_box["route_pairs"] = list(last_info.get("logic_route_pairs", logic_box.get("route_pairs", [])))
+                    logic_box["seed_streamlines"] = list(last_info.get("logic_exits", []))
+            if hide_logic_seeds:
+                logic_box = scene.get("logic_box", None)
+                if isinstance(logic_box, dict):
+                    logic_box["seed_points"] = []
+                    logic_box["seed_streamlines"] = []
+            title = (
+                f"t:{t + 1}/{max_steps} | R:{total_reward:.1f} | "
+                f"f:{(float(last_info.get('global_omega', fe.fixed_omega)) / (2.0 * np.pi)):.2f} Hz"
+            )
+            frame = renderer.render(
+                scene=scene,
+                follower_path=path_history,
+                target_pos=ctx.goal if show_target_point else None,
+                target_path=target_path if show_target_path else None,
+                title=title,
+                draw_flow=True,
+            )
+            frames.append(frame)
+
+        if done0:
+            done_early = True
+            break
+
+    if len(frames) == 0:
+        frames.append(
+            renderer.render(
+                scene=env.get_scene(),
+                follower_path=path_history,
+                target_pos=ctx.goal if show_target_point else None,
+                target_path=target_path if show_target_path else None,
+                title=f"f:{(float(fe.fixed_omega) / (2.0 * np.pi)):.2f} Hz",
+                draw_flow=True,
+            )
+        )
+    for _ in range(12):
+        frames.append(frames[-1])
+
+    Path(output_gif).parent.mkdir(parents=True, exist_ok=True)
+    imageio.mimsave(output_gif, frames, fps=fps)
+    trace_stem = Path(output_gif).with_suffix("")
+    trace_csv = trace_stem.with_name(trace_stem.name + "_omega_trace.csv")
+    trace_png = trace_stem.with_name(trace_stem.name + "_omega_trace.png")
+    if len(omega_records) > 0:
+        with trace_csv.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(omega_records[0].keys()))
+            writer.writeheader()
+            writer.writerows(omega_records)
+        _save_omega_trace_plot(omega_records, trace_png)
+    renderer.close()
+    vec_env.close()
+
+    r = np.asarray(fe.cylinders_r, dtype=np.float32)
+    killed_eps = float(getattr(LogicBoxConfig, "KILLED_EPS", 1e-6))
+    inactive_count = int(np.sum(r <= killed_eps))
+    print(f"[Saved] {output_gif}")
+    if len(omega_records) > 0:
+        print(f"[Saved] omega trace CSV: {trace_csv}")
+        print(f"[Saved] omega trace PNG: {trace_png}")
+    print(
+        f"[Summary] dynamic_omega=True, frames={len(frames)}, path_points={len(path_history)}, "
+        f"done_early={done_early}, reward={total_reward:.2f}, "
+        f"target={last_info.get('logic_target_port', logic_target_port)}, "
+        f"success={last_info.get('dynamic_success', None)}, "
+        f"miss={last_info.get('logic_miss_ratio', None)}, "
+        f"wrong={last_info.get('logic_wrong_side_ratio', None)}, "
+        f"out={last_info.get('logic_outlet_error', None)}, "
+        f"final_pos=({ctx.particle_pos[0]:.4f}, {ctx.particle_pos[1]:.4f}), "
+        f"omega={float(last_info.get('global_omega', fe.fixed_omega)):.4f}, "
+        f"inflow=({float(last_info.get('inflow_u', fe.inflow_u)):.4f},"
+        f"{float(last_info.get('inflow_v', fe.inflow_v)):.4f}), "
+        f"dead={inactive_count}/{int(r.size)}, killed_eps={killed_eps:.1e}"
     )
 
 
@@ -320,6 +549,22 @@ def parse_args():
 
 def main():
     args = parse_args()
+    LayoutModeConfig.LAYOUT_MODE = str(args.layout_mode)
+    dynamic_omega_mode = bool(is_dynamic_omega_mode(args.layout_mode))
+    dynamic_omega_design_mode = bool(is_dynamic_omega_design_mode(args.layout_mode))
+    dynamic_omega_radius_design_mode = bool(is_dynamic_omega_radius_design_mode(args.layout_mode))
+    if dynamic_omega_mode and dynamic_omega_radius_design_mode:
+        LogicBoxConfig.FIXED_LAYOUT_ENABLE = True
+        LogicBoxConfig.FIXED_GEOMETRY_ENABLE = False
+        LogicBoxConfig.KEEP_XY_ACTION_WHEN_FIXED = False
+    elif dynamic_omega_mode and dynamic_omega_design_mode:
+        LogicBoxConfig.FIXED_LAYOUT_ENABLE = False
+        LogicBoxConfig.FIXED_GEOMETRY_ENABLE = False
+        LogicBoxConfig.KEEP_XY_ACTION_WHEN_FIXED = True
+    elif dynamic_omega_mode:
+        LogicBoxConfig.FIXED_LAYOUT_ENABLE = True
+        LogicBoxConfig.FIXED_GEOMETRY_ENABLE = True
+        LogicBoxConfig.KEEP_XY_ACTION_WHEN_FIXED = False
     base_tag = build_task_tag(args.layout_mode)
     target_suffix = (
         f"_{str(args.logic_target_port).upper()}"
@@ -363,6 +608,24 @@ def main():
 
     hide_target_path = bool(args.hide_target_path or auto_hide_port_only)
     hide_logic_seeds = bool(args.hide_logic_seeds or auto_hide_port_only)
+
+    if dynamic_omega_mode:
+        print("[Mode] dynamic omega rollout: model predicts delta-omega at every step.")
+        run_dynamic_omega_rollout(
+            model_path=model_path,
+            vecnorm_path=vecnorm_path,
+            layout_mode=args.layout_mode,
+            rollout_steps=args.rollout_steps,
+            frame_stride=args.frame_stride,
+            fps=args.fps,
+            output_gif=out,
+            show_target_point=args.show_target_point,
+            show_target_path=(not hide_target_path),
+            hide_logic_seeds=hide_logic_seeds,
+            logic_target_port=args.logic_target_port,
+            logic_route_set_idx=args.logic_route_set_idx,
+        )
+        return
 
     physical_action = load_policy_action(
         model_path=model_path,

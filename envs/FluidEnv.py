@@ -14,20 +14,21 @@ from config import (
     RenderSettingConfig,
     StokesCylinderConfig,
     TrajectorySettingConfig,
+    strip_dynamic_omega_suffix,
 )
 from utils.calc import calculate_point_velocity, is_legal
 
 
 def _parse_layout_mode(layout_mode: str):
-    mode = str(layout_mode)
+    mode, dynamic_omega = strip_dynamic_omega_suffix(str(layout_mode))
     if mode.endswith("_inflow_u_fixed"):
-        return mode[:-15], True, True, True
+        return mode[:-15], True, True, True, dynamic_omega
     # Backward-compatible alias: *_inflow_u now means fixed horizontal inflow.
     if mode.endswith("_inflow_u"):
-        return mode[:-9], True, True, True
+        return mode[:-9], True, True, True, dynamic_omega
     if mode.endswith("_inflow"):
-        return mode[:-7], True, False, False
-    return mode, False, False, False
+        return mode[:-7], True, False, False, dynamic_omega
+    return mode, False, False, False, dynamic_omega
 
 
 class Particle:
@@ -57,6 +58,7 @@ class FluidEnv:
             self.use_inflow,
             self.horizontal_inflow_only,
             self.fixed_horizontal_inflow,
+            self.dynamic_omega_control,
         ) = _parse_layout_mode(self.layout_mode)
         if self.base_layout_mode not in {
             "free_layout",
@@ -318,7 +320,10 @@ class FluidEnv:
         return xx, yy
 
     def apply_layout(self, action: np.ndarray):
-        r_low = StokesCylinderConfig.MIN_R
+        if self.base_layout_mode == "logic_box_layout":
+            r_low = float(getattr(LogicBoxConfig, "MIN_R", StokesCylinderConfig.MIN_R))
+        else:
+            r_low = StokesCylinderConfig.MIN_R
         r_high = StokesCylinderConfig.MAX_R
 
         def _clip_design_radii(raw_r: np.ndarray, upper: float):
@@ -555,6 +560,28 @@ class FluidEnv:
         self.cylinders_x[:] = new_layout[:, 0]
         self.cylinders_y[:] = new_layout[:, 1]
         self.cylinders_r[:] = _clip_design_radii(new_layout[:, 2], r_high)
+
+    def apply_geometry_only(self, layout_action: np.ndarray):
+        """
+        Apply x/y/r geometry without consuming inflow/omega tail controls.
+        Used by dynamic omega design mode: geometry is selected once at
+        episode start, then omega changes over time.
+        """
+        old_inflow_dim = int(self.inflow_action_dim)
+        old_omega_dim = int(self.omega_action_dim)
+        old_u = float(self.inflow_u)
+        old_v = float(self.inflow_v)
+        old_omega = float(self.fixed_omega)
+        try:
+            self.inflow_action_dim = 0
+            self.omega_action_dim = 0
+            self.apply_layout(layout_action)
+        finally:
+            self.inflow_action_dim = old_inflow_dim
+            self.omega_action_dim = old_omega_dim
+            self.inflow_u = old_u
+            self.inflow_v = old_v
+            self.fixed_omega = old_omega
 
     def set_inflow_control_enabled(self, enabled: bool):
         self.inflow_control_enabled = bool(enabled)
