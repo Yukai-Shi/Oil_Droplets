@@ -28,6 +28,7 @@ __pycache__/
 *.npz
 *.zip
 *.pkl
+*.csv
 
 # paraview
 *.vti

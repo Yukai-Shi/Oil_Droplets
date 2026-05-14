@@ -33,8 +33,8 @@ DEFAULT_INFLOW_V = 0.0
 DEFAULT_TARGET_CLEARANCE = 0.004
 DEFAULT_OMEGA_MIN_HZ = -3.0
 DEFAULT_OMEGA_MAX_HZ = 3.0
-DEFAULT_MAX_STEPS = 320
-DEFAULT_SUBSTEPS = 8
+DEFAULT_MAX_STEPS = 900
+DEFAULT_SUBSTEPS = 24
 DEFAULT_DT = 0.006
 DEFAULT_TOTAL_TIMESTEPS = 300000
 DEFAULT_EVAL_FREQ = 10000
@@ -45,9 +45,12 @@ DEFAULT_LEARNING_RATE = 3e-4
 DEFAULT_DEVICE = "cuda"
 TRACKING_DIST_SCALE = 0.018
 TRACKING_PATH_SCORE_SCALE = 0.060
-WAYPOINT_COUNT = 36
-WAYPOINT_RADIUS = 0.007
-WAYPOINT_DIST_SCALE = 0.020
+WAYPOINT_COUNT = 24
+WAYPOINT_RADIUS = 0.011
+WAYPOINT_DIST_SCALE = 0.026
+OMEGA_ACTION_GAMMA = 2.0
+OMEGA_CHANGE_PENALTY = 0.0
+OMEGA_MAG_PENALTY = 0.015
 
 
 def fixed_grid_2x2(pitch: float, center=(0.0, 0.0)):
@@ -130,25 +133,18 @@ def target_west_stroke(stroke: str, n: int = 260):
         parts = [cubic_bezier(*seg, n=per_seg) for seg in segments]
         target = np.concatenate([part[:-1] for part in parts[:-1]] + [parts[-1]], axis=0)
     elif stroke == "e":
-        # A single-line, open lowercase-e surrogate: loop body plus a rightward exit.
-        theta = np.linspace(2.65, -2.25, int(0.72 * n), dtype=np.float32)
-        loop = np.stack(
-            [
-                0.004 + 0.080 * np.cos(theta),
-                0.006 + 0.060 * np.sin(theta),
-            ],
-            axis=1,
-        )
-        exit_pts = smooth_polyline(
-            [
-                tuple(loop[-1]),
-                (-0.010, 0.002),
-                (0.092, 0.002),
-            ],
-            n=max(12, int(0.28 * n)),
-            smooth_iters=4,
-        )
-        target = np.concatenate([loop, exit_pts[1:]], axis=0).astype(np.float32)
+        # One-stroke lowercase-e style at the same scale as the 2x2 west W:
+        # middle bar goes right first, then curls upward around the outer loop.
+        segments = [
+            ((-0.040, 0.006), (-0.014, 0.008), (0.030, 0.006), (0.047, 0.022)),
+            ((0.047, 0.022), (0.056, 0.036), (0.048, 0.050), (0.018, 0.050)),
+            ((0.018, 0.050), (-0.024, 0.050), (-0.052, 0.030), (-0.050, 0.004)),
+            ((-0.050, 0.004), (-0.060, -0.016), (-0.054, -0.044), (-0.022, -0.050)),
+            ((-0.022, -0.050), (0.010, -0.056), (0.046, -0.052), (0.058, -0.036)),
+        ]
+        per_seg = max(16, int(np.ceil(float(n) / len(segments))))
+        parts = [cubic_bezier(*seg, n=per_seg) for seg in segments]
+        target = np.concatenate([part[:-1] for part in parts[:-1]] + [parts[-1]], axis=0)
     elif stroke == "s":
         ss = np.linspace(0.0, 1.0, int(n), dtype=np.float32)
         xs = -0.095 + 0.190 * ss
@@ -236,6 +232,15 @@ class West2x2OmegaEnv(gym.Env):
             return np.array([1.0, 0.0], dtype=np.float32)
         return (tang / n).astype(np.float32)
 
+    def _action_to_omega(self, raw: float) -> float:
+        raw = float(np.clip(raw, -1.0, 1.0))
+        gamma = max(1.0, float(OMEGA_ACTION_GAMMA))
+        if self.omega_min < 0.0 < self.omega_max:
+            if raw >= 0.0:
+                return float((raw ** gamma) * self.omega_max)
+            return float(-((-raw) ** gamma) * abs(self.omega_min))
+        return float(self.omega_min + 0.5 * (raw + 1.0) * (self.omega_max - self.omega_min))
+
     def _obs(self):
         idx, _ = self._nearest_target(self.pos)
         wp_idx = int(np.clip(getattr(self, "wp_idx", 1), 0, len(self.waypoints) - 1))
@@ -274,7 +279,8 @@ class West2x2OmegaEnv(gym.Env):
 
     def step(self, action):
         raw = float(np.clip(np.asarray(action, dtype=np.float32).reshape(-1)[0], -1.0, 1.0))
-        self.omega = float(self.omega_min + 0.5 * (raw + 1.0) * (self.omega_max - self.omega_min))
+        prev_omega = float(self.omega)
+        self.omega = self._action_to_omega(raw)
         self.omega_trace.append(float(self.omega))
         omegas = np.full(len(self.cyl_x), float(self.omega), dtype=np.float32)
         collision = False
@@ -329,6 +335,9 @@ class West2x2OmegaEnv(gym.Env):
         wp_closeness = float(np.exp(-min(6.0, wp_dist_norm * wp_dist_norm)))
         reverse_pen = max(0.0, -float(idx_delta)) / float(max(1, len(self.target) - 1))
         wp_progress = max(0.0, float(self.prev_wp_dist) - wp_dist)
+        omega_scale = max(abs(float(self.omega_min)), abs(float(self.omega_max)), 1e-8)
+        omega_delta_norm = float((self.omega - prev_omega) / omega_scale)
+        omega_norm = float(self.omega / omega_scale)
 
         reward = 120.0 * wp_progress
         reward += 22.0 * score_gain
@@ -342,17 +351,25 @@ class West2x2OmegaEnv(gym.Env):
         reward -= 0.10 * min(3.0, score_now / max(float(TRACKING_PATH_SCORE_SCALE), 1e-8))
         reward -= 0.010
         reward -= 0.012 * raw * raw
+        reward -= float(OMEGA_CHANGE_PENALTY) * omega_delta_norm * omega_delta_norm
+        reward -= float(OMEGA_MAG_PENALTY) * omega_norm * omega_norm
 
         reached_wp = False
         advanced_wp = 0
-        while wp_dist <= float(WAYPOINT_RADIUS) and self.wp_idx < len(self.waypoints) - 1:
-            self.wp_idx += 1
-            advanced_wp += 1
-            reached_wp = True
-            wp = self.waypoints[self.wp_idx]
-            wp_dist = float(np.linalg.norm(wp - self.pos))
+        future_wp = self.waypoints[self.wp_idx :]
+        if future_wp.shape[0] > 0:
+            future_dist = np.linalg.norm(future_wp - self.pos[None, :], axis=1)
+            hit_offsets = np.where(future_dist <= float(WAYPOINT_RADIUS))[0]
+            if hit_offsets.size > 0:
+                new_wp_idx = min(len(self.waypoints) - 1, self.wp_idx + int(np.max(hit_offsets)) + 1)
+                advanced_wp = max(0, int(new_wp_idx - self.wp_idx))
+                if advanced_wp > 0:
+                    self.wp_idx = int(new_wp_idx)
+                    reached_wp = True
+                    wp = self.waypoints[self.wp_idx]
+                    wp_dist = float(np.linalg.norm(wp - self.pos))
         if reached_wp:
-            reward += 3.0 * float(advanced_wp)
+            reward += 4.0 * float(advanced_wp)
 
         done = False
         success = False
@@ -392,6 +409,7 @@ class West2x2OmegaEnv(gym.Env):
             "dist_norm": float(dist_norm),
             "omega": float(self.omega),
             "omega_hz": float(self.omega / (2.0 * np.pi)),
+            "omega_delta_norm": float(omega_delta_norm),
             "omega_trace": list(self.omega_trace),
             "path": [p.tolist() for p in self.path],
             "final_pos": self.pos.tolist(),
@@ -483,6 +501,7 @@ class West2x2EvalCallback(BaseCallback):
                 f"close={float(info.get('tracking_closeness', 0.0)):.2f} "
                 f"align={float(info.get('tangent_align', 0.0)):.2f} "
                 f"vt={float(info.get('tangent_speed', 0.0)):.4f} "
+                f"domega={float(info.get('omega_delta_norm', 0.0)):.2f} "
                 f"f={float(info.get('omega_hz', 0.0)):.3f}Hz"
             )
         if metric > self.best_reward:
