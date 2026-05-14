@@ -214,6 +214,100 @@ python test.py --layout-mode logic_box_layout_inflow_u_fixed_omega_rt_radius_des
 python test.py --layout-mode logic_box_layout_inflow_u_fixed_omega_rt_radius_design --model models\best\<your_tag>\best_model.zip --vecnorm models\best\<your_tag>\vecnormalize_best.pkl --logic-target-port R2 --rollout-steps 260
 ```
 
+### 4.2.3 3x3 固定半径笔画训练
+
+如果目标是先验证“固定 3x3 位置和半径，只靠实时统一转速 `omega(t)` 让粒子轨迹贴合一个简单笔画”，用独立脚本：
+
+```text
+train_3x3_stroke_omega.py
+```
+
+这个脚本不使用 logic-box 端口奖励，动作只有：
+
+```text
+delta_omega
+```
+
+默认输出统一放到：
+
+```text
+models/stroke/<run_tag>/
+```
+
+先建议训练最容易的 `soft_u`：
+
+```powershell
+python train_3x3_stroke_omega.py `
+  --stroke soft_u `
+  --radius 0.010 `
+  --total-timesteps 300000 `
+  --eval-freq 10000 `
+  --run-alias first_soft_u
+```
+
+输出内容：
+
+```text
+models/stroke/<run_tag>/best/best_model.zip
+models/stroke/<run_tag>/best/vecnormalize_best.pkl
+models/stroke/<run_tag>/best/best.png
+models/stroke/<run_tag>/best/best_omega_trace.csv
+models/stroke/<run_tag>/frames/eval_*.png
+models/stroke/<run_tag>/traces/eval_*_omega_trace.csv
+```
+
+### 4.2.4 2x2 west 四个子任务笔画训练
+
+如果目标是先把手写 `west` 拆成四个更简单的子任务，并且使用 `2x2` 固定圆柱、水平来流、实时统一转速 `omega(t)`，用独立脚本：
+
+```text
+train_2x2_west_omega.py
+```
+
+核心约束：
+- 圆柱数量固定为 `4`，排布为 `2x2`；
+- 圆柱半径固定；
+- 圆心距默认自动设置为 `6 * radius`，也就是 `3` 个圆柱直径；
+- 有水平来流，默认 `--inflow-u 0.006`；
+- 动作只有一个：`delta_omega`，表示每个控制步调整统一全局转速；
+- 四个子任务分别是 `--stroke w/e/s/t`，建议分别训练。
+
+训练命令示例：
+
+```powershell
+python train_2x2_west_omega.py `
+  --stroke w `
+  --radius 0.010 `
+  --total-timesteps 300000 `
+  --eval-freq 10000 `
+  --run-alias west_w
+```
+
+四个子任务可以分别跑：
+
+```powershell
+python train_2x2_west_omega.py --stroke w --radius 0.010 --total-timesteps 300000 --eval-freq 10000 --run-alias west_w
+python train_2x2_west_omega.py --stroke e --radius 0.010 --total-timesteps 300000 --eval-freq 10000 --run-alias west_e
+python train_2x2_west_omega.py --stroke s --radius 0.010 --total-timesteps 300000 --eval-freq 10000 --run-alias west_s
+python train_2x2_west_omega.py --stroke t --radius 0.010 --total-timesteps 300000 --eval-freq 10000 --run-alias west_t
+```
+
+输出默认在：
+
+```text
+models/stroke/west_2x2/<run_tag>/
+```
+
+其中：
+- `best/best_model.zip`：当前最好模型；
+- `best/vecnormalize_best.pkl`：归一化参数；
+- `best/frames/best.png`：最好评估图；
+- `best/traces/best_omega_trace.csv`：最好轨迹对应的转速时序；
+- `frames/eval_*.png`：每次评估图；
+- `traces/eval_*_omega_trace.csv`：每次评估的转速时序。
+
+如果要手动改变圆心距，可以加 `--pitch`；不加时始终满足 `圆心距 = 3 * 直径`。
+
 ### 4.3 先找布局，再锁定布局训练实时转速
 
 如果你还没有固定几何，使用这个两阶段脚本：
